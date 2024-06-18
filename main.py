@@ -1,4 +1,3 @@
-import os
 import random
 from datetime import datetime
 
@@ -7,10 +6,7 @@ import torch
 import torch.multiprocessing as mp
 from omegaconf import DictConfig, OmegaConf
 
-from data import (
-    get_dataloader,
-    get_task,
-)
+from data import get_dataloader, get_task
 from helpers import get_nb_trainable_parameters
 from logger import get_logger
 from models.gpt2 import GPT2Editor, GPT2EditorConfig
@@ -31,9 +27,6 @@ def main(config: DictConfig):
 
     torch.manual_seed(config.seed)
     random.seed(config.seed)
-
-    os.makedirs(config.data_dir, exist_ok=True)
-    os.makedirs(config.ckpt_dir, exist_ok=True)
 
     model_config = GPT2EditorConfig(
         name_or_path=config.model,

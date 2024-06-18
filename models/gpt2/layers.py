@@ -393,6 +393,159 @@ class EditorUnembedCrossAttention(GPT2Attention):
                     outputs = (attn_output, present)
 
         return outputs  # a, present, (attentions)
+    
+    
+class InterpretorUnembedCrossAttention(EditorUnembedCrossAttention):
+    is_cross_attention = True
+    _flash_attn_enabled = False
+    
+    def __init__(self, config: GPT2EditorConfig, layer_idx=None, **kwargs):
+        super().__init__(config, layer_idx, **kwargs)
+        self.intervention_layer = config.default_intervention_layer
+        self.q_proj = nn.Linear(self.embed_dim, self.embed_dim * 2, bias=False)
+        self.q_proj.weight = nn.Parameter(torch.randn(self.embed_dim, self.embed_dim * 2))
+        nn.init.uniform_(self.q_proj.weight)
+        
+    def forward(
+        self,
+        hidden_states: Optional[Tuple[torch.FloatTensor]],
+        layer_past: Optional[Tuple[torch.Tensor]] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        base_encoder_hidden_states: Optional[torch.Tensor] = None,
+        base_encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        source_encoder_hidden_states: Optional[torch.Tensor] = None,
+        source_encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = False,
+        output_attentions: Optional[bool] = False,
+    ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]], ...]:
+        if base_encoder_hidden_states is not None or source_encoder_hidden_states is not None:
+            if not hasattr(self, "q_attn"):
+                raise ValueError(
+                    "If class is used as cross attention, the weights `q_attn` have to be defined. "
+                    "Please make sure to instantiate class with `GPT2Attention(..., is_cross_attention=True)`."
+                )
+        else:
+            raise ValueError("This class is only meant to be used as cross attention")
+            # query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
+        
+        n_layers = self.config.n_layer + 1
+        base_n_tokens = base_encoder_attention_mask.shape[-1] // n_layers
+        source_n_tokens = source_encoder_attention_mask.shape[-1] // n_layers
+        
+        base_start, base_end = (
+            self.intervention_layer * base_n_tokens,
+            (self.intervention_layer + 1) * base_n_tokens   
+        )
+        
+        source_start, source_end = (
+            self.intervention_layer * source_n_tokens,
+            (self.intervention_layer + 1) * source_n_tokens
+        )
+              
+        base_encoder_attention_mask = base_encoder_attention_mask[:, base_start: base_end]
+        base_encoder_hidden_states = base_encoder_hidden_states[:, base_start: base_end, :]
+        source_encoder_attention_mask = source_encoder_attention_mask[:, source_start: source_end]
+        source_encoder_hidden_states = source_encoder_hidden_states[:, source_start: source_end, :]
+        
+        expanded_base_encoder_hidden_states = base_encoder_hidden_states.unsqueeze(1).expand(-1, source_n_tokens, -1, -1)
+        expanded_source_encoder_hidden_states = source_encoder_hidden_states.unsqueeze(2).expand(-1, -1, base_n_tokens, -1)
+        
+        encoder_hidden_states = torch.concat([expanded_base_encoder_hidden_states, expanded_source_encoder_hidden_states], dim=-1)
+        encoder_hidden_states = self.q_proj(encoder_hidden_states)
+        
+        encoder_attention_mask = torch.einsum("bq,bs->bsq", base_encoder_attention_mask, source_encoder_attention_mask)
+                
+        batch_size, source_n_tokens, base_n_tokens = encoder_attention_mask.shape
+        
+        encoder_hidden_states = encoder_hidden_states.reshape(
+            batch_size, 
+            source_n_tokens * base_n_tokens,
+            -1
+        )
+        
+        encoder_attention_mask = encoder_attention_mask.reshape(
+            batch_size,
+            source_n_tokens * base_n_tokens
+        )
+        
+        
+        for i in range(self.config.edit_channel_multiply_factor):
+            query = self.q_attn[i](encoder_hidden_states)
+            # We only take the last position hidden state from the editor
+            key, value = self.c_attn[i](hidden_states[:, -1, :]).split(
+                self.split_size, dim=-1
+            )
+            # print(encoder_hidden_states.shape) #torch.Size([8, 104, 768]) #I believe this is the result of torch.stacking a [8, 8, 13, 768] tensor along d=2
+            # To construct the mask, we can write the mask in matrix form and then stack along d = 2
+            attention_mask = encoder_attention_mask
+
+            # (bsz, seq_len, num_heads, head_dim) -> (bsz, num_heads, seq_len, head_dim)
+            query = self._split_heads(query).permute(0, 2, 1, 3)
+            key = self._split_heads(key).unsqueeze(-2)
+            value = self._split_heads(value).unsqueeze(-2)
+
+            if layer_past is not None:
+                past_key, past_value = layer_past
+                key = torch.cat((past_key, key), dim=-2)
+                value = torch.cat((past_value, value), dim=-2)
+
+            if use_cache is True:
+                present = (key, value)
+            else:
+                present = None
+
+            if self.reorder_and_upcast_attn:
+                attn_output, attn_weights = self._upcast_and_reordered_attn(
+                    query, key, value, attention_mask, head_mask
+                )
+            else:
+                attn_output, attn_weights = self._attn(
+                    query, key, value, attention_mask, head_mask
+                )
+                
+            attn_output = attn_output.reshape(
+                batch_size,
+                self.config.edit_channel_multiply_factor,
+                source_n_tokens, 
+                base_n_tokens, 
+                -1
+            )
+            
+            attn_weights = attn_weights.reshape(
+                batch_size,
+                self.config.edit_channel_multiply_factor,
+                source_n_tokens, 
+                base_n_tokens
+            )
+            
+
+            if i == 0:
+                outputs = (attn_output, present)
+                stacking_dim=1
+                outputs += (attn_weights.unsqueeze(stacking_dim),)
+            else:
+                if use_cache is True:
+                    raise ValueError(
+                        "Error, key-value caching for this is not implemented. Should we even be doing this? -Mike"
+                    )
+                # Check stacking dimensions!
+                # Find which dimension of attn_weights is equal to the number of heads per multiply
+                # Then stack along that dimension
+                # Don't use number of heads equal to 786 until this is cleared up!
+                #stacking_dim = attn_weights.shape.index(self.heads_per_multiply)
+                
+                attn_output_old, _, attn_weights_old = outputs
+                attn_output += attn_output_old
+
+                attn_weights = torch.cat(
+                    (attn_weights_old, attn_weights.unsqueeze(1)), dim=stacking_dim
+                )
+                outputs = (attn_output, present, attn_weights)
+                
+        return outputs  # a, present, (attentions)
+        
+        
 
 
 class OldEditorAttention(nn.Module):
