@@ -21,33 +21,30 @@ from ..utils import (
     add_fwd_hooks,
     assign_layer_indices,
 )
-from .layers import EditorUnembedCrossAttention
+from .layers import InterpretorUnembedCrossAttention
 
-T = TypeVar("T", bound="GPT2Editor")
+T = TypeVar("T", bound="GPT2Interpretor")
 
 
-class GPT2EditorConfig(GPT2Config, EditorConfig):
-    init_attn_proj_bias: bool = False
+class GPT2InterpretorConfig(GPT2Config, EditorConfig):
     compute_position_ids: bool = True
-    use_ghost_token: bool = False
-    cross_attn_layers: List[int] = []
-    restrict_edit_to_layers: List[int] = []
-    restrict_edit_to_positions: List[int] = []
+    default_intervention_layer: int = 6
 
 
-class GPT2EditorHypernetwork(GPT2LMHeadModel):
+class GPT2InterpretorHypernetwork(GPT2LMHeadModel):
     _tied_weights_keys = []
 
-    def __init__(self, config: GPT2EditorConfig):
+    def __init__(self, config: GPT2InterpretorConfig):
         super().__init__(config)
         self.transformer = GPT2Model(config)
+        
         # only LM head gets special attention
         if config._attn_implementation == "flash_attention_2":
             _attention_cls = GPT2FlashAttention2
         else:
             _attention_cls = GPT2Attention
 
-        self.lm_head = EditorUnembedCrossAttention(
+        self.lm_head = InterpretorUnembedCrossAttention(
             config=config, layer_idx=config.chop_editor_at_layer
         )
 
@@ -92,10 +89,13 @@ class GPT2EditorHypernetwork(GPT2LMHeadModel):
         position_ids: Optional[torch.LongTensor] = None,
         head_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        base_encoder_hidden_states: Optional[torch.Tensor] = None,
+        base_encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        source_encoder_hidden_states: Optional[torch.Tensor] = None,
+        source_encoder_attention_mask: Optional[torch.FloatTensor] = None,
         # labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
+        output_intervention_ratio: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -114,6 +114,14 @@ class GPT2EditorHypernetwork(GPT2LMHeadModel):
             and self.config.compute_position_ids
         ):
             position_ids = attention_mask.cumsum(-1)
+        
+        encoder_hidden_states = torch.cat(
+            (base_encoder_hidden_states, source_encoder_hidden_states), dim=1
+        )
+        
+        encoder_attention_mask = torch.cat(
+            (base_encoder_attention_mask, source_encoder_attention_mask), dim=1
+        )
 
         transformer_outputs = self.transformer(
             input_ids,
@@ -130,19 +138,21 @@ class GPT2EditorHypernetwork(GPT2LMHeadModel):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
         )
+        
         hidden_states = transformer_outputs[0]
 
         # Set device for model parallelism
         if self.model_parallel:
             torch.cuda.set_device(self.transformer.first_device)
             hidden_states = hidden_states.to(self.lm_head.weight.device)
-        # else: #delete?  #IDK if this next pair of lines is necessary at all!
-        #     hidden_states = hidden_states.to(self.lm_head.weight.device) # delete?
 
         reverse_attention_output = self.lm_head(
             hidden_states,
             attention_mask=attention_mask,
-            encoder_hidden_states=encoder_hidden_states,
+            base_encoder_hidden_states=base_encoder_hidden_states,
+            base_encoder_attention_mask=base_encoder_attention_mask,
+            source_encoder_hidden_states=source_encoder_hidden_states,
+            source_encoder_attention_mask=source_encoder_attention_mask,
             output_attentions=output_attentions,
         )
 
@@ -150,12 +160,12 @@ class GPT2EditorHypernetwork(GPT2LMHeadModel):
         return reverse_attention_output
 
 
-class GPT2Editor(nn.Module):
-    def __init__(self, config: GPT2EditorConfig):
+class GPT2Interpretor(nn.Module):
+    def __init__(self, config: GPT2InterpretorConfig):
         super().__init__()
 
         self.config = config
-        self.hypernetwork = GPT2EditorHypernetwork(config)
+        self.hypernetwork = GPT2InterpretorHypernetwork(config)
         self.target_model = AutoModelForCausalLM.from_pretrained(
             config.name_or_path
         ).eval()
@@ -219,215 +229,137 @@ class GPT2Editor(nn.Module):
         self,
         editor_input_ids: torch.Tensor = None,
         editor_attention_mask: torch.Tensor = None,
-        target_input_ids: torch.Tensor = None,
-        target_attention_mask: torch.Tensor = None,
-        target_hidden_states: torch.Tensor = None,
-        target_position_ids: torch.Tensor = None,
+        base_input_ids: torch.Tensor = None,
+        base_attention_mask: torch.Tensor = None,
+        source_input_ids: torch.Tensor = None,
+        source_attention_mask: torch.Tensor = None,
+        base_hidden_states: torch.Tensor = None,
+        base_position_ids: torch.Tensor = None,
+        source_hidden_states: torch.Tensor = None,
+        source_position_ids: torch.Tensor = None,
+        intervention_layer: int = None,
         output_target_hidden_states: bool = False,
         output_edited_hidden_states: bool = False,
-        output_edit_vectors: bool = False,
-        output_editor_attention: bool = False,
-        stop_editing_idx: int = None,
-        batch_edit_vectors: torch.Tensor = None,
+        output_intervention_ratio: bool = False,
+        batch_intervention_ratio: torch.Tensor = None,
     ) -> EditorModelOutput:
+        
+        if intervention_layer is None:
+            intervention_layer = self.config.default_intervention_layer        
+        
         # Run target model for encoded hidden states
-        if target_hidden_states is None:
-            # Add a ghost token to the input_ids and turn off its attention mask
-            if self.config.use_ghost_token:
-                ghost_token = torch.zeros_like(target_input_ids[:, 0:1])
-                target_input_ids = torch.cat((ghost_token, target_input_ids), dim=1)
-                ghost_invisible_attention_mask = torch.cat(
-                    (torch.zeros_like(ghost_token), target_attention_mask), dim=1
-                )
-                ghost_present_attention_mask = torch.cat(
-                    (torch.ones_like(ghost_token), target_attention_mask), dim=1
-                )
-
-                # This is altered! We give a position_id of 42 to the ghost token by default.
-                if target_position_ids is None:
-                    # create position_ids on the fly for batch generation
-                    target_position_ids = (
-                        ghost_invisible_attention_mask.long().cumsum(-1) - 1
-                    )
-                    target_position_ids.masked_fill_(
-                        ghost_invisible_attention_mask == 0, 1
-                    )
-                    target_position_ids[:, 0] = torch.full_like(
-                        target_position_ids[:, 0], 42
-                    )
-                    # we aren't using past_key_values I assume. If we did, we'd use something like:
-                    # if past_key_values:
-                    #     position_ids = position_ids[:, -input_ids.shape[1] :]
-
-                target_hidden_states = torch.stack(
-                    self._run_target_model_for_encoded_hidden_states(
-                        target_input_ids,
-                        target_attention_mask=ghost_invisible_attention_mask,
-                        position_ids=target_position_ids,
-                    ),  # seems to break while we are passing thru batch_size=1; the last (12th =) has different dimensions
-                    dim=2,
-                )
-            else:
-                target_hidden_states = torch.stack(
-                    self._run_target_model_for_encoded_hidden_states(
-                        target_input_ids, target_attention_mask, target_position_ids
-                    ),  # seems to break while we are passing thru batch_size=1; the last (12th =) has different dimensions
-                    dim=2,
-                )
+        if base_hidden_states is None:
+            base_hidden_states = torch.stack(
+                self._run_target_model_for_encoded_hidden_states(
+                    base_input_ids, base_attention_mask, base_position_ids
+                ),  # seems to break while we are passing thru batch_size=1; the last (12th =) has different dimensions
+                dim=2,
+            )
+        
+        if source_hidden_states is None:
+            source_hidden_states = torch.stack(
+                self._run_target_model_for_encoded_hidden_states(
+                    source_input_ids, source_attention_mask, source_position_ids
+                ),
+                dim=2,
+            )
+            
         # dimensions of target_hidden_states:
         # batch_size, token_sequence_length, num_layers = 13, resid_width = 768
-
-        if self.config.use_ghost_token:
-            target_attention_mask = ghost_present_attention_mask
-
-        mask_sum = target_attention_mask.cumsum(-1)
-        mask_sum_min = mask_sum.min(dim=-1)[0]
-        edit_window_mask = (
-            torch.arange(
-                0, target_attention_mask.shape[-1], device=target_attention_mask.device
-            )
-            .unsqueeze(0)
-            .repeat(target_attention_mask.shape[0], 1)
-        )
-        edit_window_mask[mask_sum > 0] += (
-            mask_sum_min.unsqueeze(-1).repeat(1, mask_sum.shape[-1]).view(-1)
-        )
-        stop_edit_mask = torch.logical_and(
-            edit_window_mask > 0, edit_window_mask <= stop_editing_idx
-        )
-
-        # If we are stopping editing at stop_editing_idx, then we eliminate target_hidden_states beyond that index
-        if stop_editing_idx is not None:
-            target_hidden_states = (
-                target_hidden_states[stop_edit_mask]
-                .reshape(
-                    target_hidden_states.shape[0],
-                    stop_editing_idx,
-                    *target_hidden_states.shape[2:],
-                )
-                .clone()
-            )
-
         # Normalize along the last dimension
-        normalization_factors = target_hidden_states.norm(dim=-1, keepdim=True)
-        target_hidden_states = target_hidden_states / normalization_factors
+        base_normalization_factors = base_hidden_states.norm(dim=-1, keepdim=True)
+        base_hidden_states = base_hidden_states / base_normalization_factors
+        
+        source_normalization_factors = source_hidden_states.norm(dim=-1, keepdim=True)
+        source_hidden_states = source_hidden_states / source_normalization_factors
 
         # Error catching:
-        if batch_edit_vectors is not None:
-            if output_edit_vectors or output_editor_attention:
+        
+        # batch_intervention_ratio = (batch_size, source_token_sequence_length, base_token_sequence_length)
+        if batch_intervention_ratio is not None:
+            if output_intervention_ratio:
                 raise ValueError(
-                    "Inputting your own batch_edit_vectors means the model does not construct the outputs you are requesting"
+                    "Inputting your own batch_intervention_ratio means the model does not construct the outputs you are requesting"
                 )
 
         # Run editor model, get edit vectors
-        if batch_edit_vectors is None:
-            if self.layerwise_embeddings is not None:
-                # Now, add in the layerwise embeddings
-                embedded_hidden_states = (
-                    target_hidden_states + self.layerwise_embeddings[None, None, :, :]
-                )
+        if batch_intervention_ratio is None:
+            
+            n_layer = base_hidden_states.shape[2]
+            
+            # collapsed_base_hidden_states (batch_size, token_sequence_length * num_layers, resid_width)
+            collapsed_base_hidden_states = base_hidden_states.reshape(
+                base_hidden_states.shape[0],
+                base_hidden_states.shape[1] * base_hidden_states.shape[2],
+                base_hidden_states.shape[3],
+            )
+            # collapsed_base_attention_mask (batch_size, token_sequence_length * num_layers)
+            collapsed_base_attention_mask = base_attention_mask.repeat(1, n_layer)
+            
+            collapsed_source_hidden_states = source_hidden_states.reshape(
+                source_hidden_states.shape[0],
+                source_hidden_states.shape[1] * source_hidden_states.shape[2],
+                source_hidden_states.shape[3],
+            )
+            
+            collapsed_source_attention_mask = source_attention_mask.repeat(1, n_layer)
 
-                collapsed_target_hidden_states = embedded_hidden_states.reshape(
-                    target_hidden_states.shape[0],
-                    target_hidden_states.shape[1] * target_hidden_states.shape[2],
-                    target_hidden_states.shape[3],
-                )
-            else:
-                collapsed_target_hidden_states = target_hidden_states.reshape(
-                    target_hidden_states.shape[0],
-                    target_hidden_states.shape[1] * target_hidden_states.shape[2],
-                    target_hidden_states.shape[3],
-                )
-
-            editor_output = self.hypernetwork(
+            interpretor_output = self.hypernetwork(
                 input_ids=editor_input_ids,
                 attention_mask=editor_attention_mask,
-                encoder_hidden_states=collapsed_target_hidden_states,
-                output_attentions=output_editor_attention,
+                base_encoder_hidden_states=collapsed_base_hidden_states,
+                base_encoder_attention_mask=collapsed_base_attention_mask,
+                source_encoder_hidden_states=collapsed_source_hidden_states,
+                source_encoder_attention_mask=collapsed_source_attention_mask,
+                output_intervention_ratio=output_intervention_ratio,
             )
 
             # Multiply the outputs by normalization factors
-            if output_editor_attention:
-                temp_edit_vectors, _, batch_editor_attention = editor_output
-            else:
-                temp_edit_vectors, _ = editor_output
-
-            # Renormalize to the scale of the target hidden states
-            # and reshape to proper dimensions
-            batch_edit_vectors = (
-                self.config.edit_dampening_factor
-                * normalization_factors
-                * temp_edit_vectors.reshape(
-                    temp_edit_vectors.shape[0],
-                    -1,
-                    self.config.n_layer + 1,
-                    self.config.n_embd,
-                )
-            )
-
-        # If we are stopping editing at stop_editing_index,
-        # this pads batch_edit_vectors with 0's to the left of the edited positions
-        if stop_editing_idx is not None:
-            padded_batch_edits = torch.zeros(
-                batch_edit_vectors.shape[0],
-                target_input_ids.shape[1],
-                self.config.n_layer + 1,
-                self.config.n_embd,
-                device=batch_edit_vectors.device,
-                dtype=batch_edit_vectors.dtype,
-            )
-            padded_batch_edits[stop_edit_mask] = batch_edit_vectors.reshape(
-                -1, *batch_edit_vectors.shape[2:]
-            )
-            batch_edit_vectors = padded_batch_edits
-
+            intervention_output, _, batch_intervention_ratio = interpretor_output
+            
+            batch_intervention_ratio = batch_intervention_ratio.squeeze()
+            
+            
+        source_output = self.target_model(
+            input_ids=source_input_ids,
+            attention_mask=source_attention_mask,
+            output_hidden_states=True,
+        )
+        
+        source_hidden_states = source_output.hidden_states[intervention_layer]
+        intervention_matrix = torch.einsum("bij,bid->bijd", batch_intervention_ratio, source_hidden_states)
+        intervention_matrix = intervention_matrix.sum(dim=1)
+        base_intervention_weights = torch.sum(batch_intervention_ratio, dim=1)
+        
         # Run target model with edit vectors.
         # This adds the edit vectors to the given hidden state at the specified batch index, position, and layer
-        def edit_add(module, input, output):
-            layer_index = module.layer_index
-            output[0][:] = output[0] + batch_edit_vectors[:, :, layer_index, :]
-            if self.config.kill_token_zero:
-                output[0][:, 0, :] = 0
-
-        def embedding_edit_add(module, input, output):
-            output[:] = output + batch_edit_vectors[:, :, 0, :]
-            if self.config.kill_token_zero:
-                output[:, 0, :] = 0
-
+        def representation_swap(module, input, output):
+            res_diff = torch.einsum("bid,bi->bid", output[0].clone(), base_intervention_weights)
+            output[0][:] += (intervention_matrix - res_diff)
+            
+        def embedding_representation_swap(module, input, output):
+            res_diff = torch.einsum("bid,bi->bid", output.clone(), base_intervention_weights)
+            output[:] += (intervention_matrix - res_diff)          
+        
         # Now editing the target model
-        hooks1 = [(self.target_model.transformer.wte, embedding_edit_add)]
-        hooks2 = [
-            (self.target_model.transformer.h[L], edit_add)
-            for L in range(self.target_model.config.n_layer)
-        ]
-        hooks = hooks1 + hooks2
-
-        if self.config.use_ghost_token:
-            target_attention_mask = ghost_present_attention_mask
+        if intervention_layer == 0:
+            hooks = [(self.target_model.transformer.wte, embedding_representation_swap)]
+        else:
+            hooks = [(self.target_model.transformer.h[intervention_layer - 1], representation_swap)]
 
         with add_fwd_hooks(hooks):
             # THIS IS THE LINE WHERE THE MODEL IS CALLED (AND THE EDITOR IS CALLED AT
             # THE END OF `layer` AS A SIDE EFFECT)
             target_result = self.target_model(
-                input_ids=target_input_ids,
-                attention_mask=target_attention_mask,
-                position_ids=target_position_ids,
+                input_ids=base_input_ids,
+                attention_mask=base_attention_mask,
+                position_ids=base_position_ids,
                 output_hidden_states=output_edited_hidden_states,
             )
-
-        # Drop the outputs atop the ghost token
-        if self.config.use_ghost_token:
-            target_result.logits = target_result.logits[:, 1:, :]
-
+    
         logits = target_result.logits
-
+        
         output = EditorModelOutput(logits=logits)
-        if output_target_hidden_states:
-            output.target_hidden_states = target_hidden_states * normalization_factors
         if output_edited_hidden_states:
             output.edited_hidden_states = target_result.hidden_states
-        if output_edit_vectors:
-            output.edit_vectors = batch_edit_vectors
-        if output_editor_attention:
-            output.editor_attention = batch_editor_attention
         return output

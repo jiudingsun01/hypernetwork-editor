@@ -3,19 +3,19 @@ from typing import Optional, Tuple, Union
 import torch
 import torch.nn as nn
 from torch.cuda.amp import autocast
-from transformers.models.gpt2.modeling_gpt2 import (
-    GPT2Attention,
+from transformers.models.llama.modeling_llama import (
+    LlamaAttention,
 )
-
-from .config import GPT2EditorConfig
 from transformers.pytorch_utils import Conv1D
 
+from .config import LlamaEditorConfig
 
-class EditorUnembedCrossAttention(GPT2Attention):
+
+class EditorUnembedCrossAttention(LlamaAttention):
     is_cross_attention = True
     _flash_attn_enabled = False
 
-    def __init__(self, config: GPT2EditorConfig, layer_idx=None, **kwargs):
+    def __init__(self, config: LlamaEditorConfig, layer_idx=None, **kwargs):
         nn.Module.__init__(self)
         self.config = config
         max_positions = config.n_positions

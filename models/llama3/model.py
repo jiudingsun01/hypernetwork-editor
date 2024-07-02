@@ -27,12 +27,7 @@ T = TypeVar("T", bound="GPT2Interpretor")
 
 
 class GPT2InterpretorConfig(GPT2Config, EditorConfig):
-    init_attn_proj_bias: bool = False
     compute_position_ids: bool = True
-    use_ghost_token: bool = False
-    cross_attn_layers: List[int] = []
-    restrict_edit_to_layers: List[int] = []
-    restrict_edit_to_positions: List[int] = []
     default_intervention_layer: int = 6
 
 
@@ -150,8 +145,6 @@ class GPT2InterpretorHypernetwork(GPT2LMHeadModel):
         if self.model_parallel:
             torch.cuda.set_device(self.transformer.first_device)
             hidden_states = hidden_states.to(self.lm_head.weight.device)
-        # else: #delete?  #IDK if this next pair of lines is necessary at all!
-        #     hidden_states = hidden_states.to(self.lm_head.weight.device) # delete?
 
         reverse_attention_output = self.lm_head(
             hidden_states,
@@ -281,6 +274,8 @@ class GPT2Interpretor(nn.Module):
         source_hidden_states = source_hidden_states / source_normalization_factors
 
         # Error catching:
+        
+        # batch_intervention_ratio = (batch_size, source_token_sequence_length, base_token_sequence_length)
         if batch_intervention_ratio is not None:
             if output_intervention_ratio:
                 raise ValueError(
@@ -291,12 +286,14 @@ class GPT2Interpretor(nn.Module):
         if batch_intervention_ratio is None:
             
             n_layer = base_hidden_states.shape[2]
-                    
+            
+            # collapsed_base_hidden_states (batch_size, token_sequence_length * num_layers, resid_width)
             collapsed_base_hidden_states = base_hidden_states.reshape(
                 base_hidden_states.shape[0],
                 base_hidden_states.shape[1] * base_hidden_states.shape[2],
                 base_hidden_states.shape[3],
             )
+            # collapsed_base_attention_mask (batch_size, token_sequence_length * num_layers)
             collapsed_base_attention_mask = base_attention_mask.repeat(1, n_layer)
             
             collapsed_source_hidden_states = source_hidden_states.reshape(
@@ -318,9 +315,9 @@ class GPT2Interpretor(nn.Module):
             )
 
             # Multiply the outputs by normalization factors
-            intervention_output, _, intervention_weights = interpretor_output
+            intervention_output, _, batch_intervention_ratio = interpretor_output
             
-            intervention_weights = intervention_weights.squeeze()
+            batch_intervention_ratio = batch_intervention_ratio.squeeze()
             
             
         source_output = self.target_model(
@@ -330,9 +327,9 @@ class GPT2Interpretor(nn.Module):
         )
         
         source_hidden_states = source_output.hidden_states[intervention_layer]
-        intervention_matrix = torch.einsum("bij,bid->bijd", intervention_weights, source_hidden_states)
+        intervention_matrix = torch.einsum("bij,bid->bijd", batch_intervention_ratio, source_hidden_states)
         intervention_matrix = intervention_matrix.sum(dim=1)
-        base_intervention_weights = torch.sum(intervention_weights, dim=1)
+        base_intervention_weights = torch.sum(batch_intervention_ratio, dim=1)
         
         # Run target model with edit vectors.
         # This adds the edit vectors to the given hidden state at the specified batch index, position, and layer
@@ -341,9 +338,9 @@ class GPT2Interpretor(nn.Module):
             output[0][:] += (intervention_matrix - res_diff)
             
         def embedding_representation_swap(module, input, output):
-            output = output            
+            res_diff = torch.einsum("bid,bi->bid", output.clone(), base_intervention_weights)
+            output[:] += (intervention_matrix - res_diff)          
         
-
         # Now editing the target model
         if intervention_layer == 0:
             hooks = [(self.target_model.transformer.wte, embedding_representation_swap)]
