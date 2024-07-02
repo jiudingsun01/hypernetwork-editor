@@ -6,14 +6,17 @@ import torch
 import torch.nn as nn
 from transformers import (
     AutoModelForCausalLM,
-    GPT2Config,
-    GPT2LMHeadModel,
-    GPT2Model,
+    LlamaConfig,
+    LlamaModel,
+    LlamaForCausalLM,
 )
-from transformers.models.gpt2.modeling_gpt2 import (
-    GPT2Attention,
-    GPT2FlashAttention2,
+from transformers.models.llama.modeling_llama import (
+    LlamaAttention,
+    LlamaFlashAttention2,
 )
+
+from transformers.cache_utils import StaticCache, DynamicCache, Cache
+from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from ..utils import (
     EditorConfig,
@@ -21,59 +24,226 @@ from ..utils import (
     add_fwd_hooks,
     assign_layer_indices,
 )
-from .layers import InterpretorUnembedCrossAttention
+from .layers import InterpretorUnembedCrossAttention, LlamaDecoderLayerWithCrossAttention
 
-T = TypeVar("T", bound="GPT2Interpretor")
+T = TypeVar("T", bound="LlamaInterpretor")
 
 
-class GPT2InterpretorConfig(GPT2Config, EditorConfig):
+class LlamaInterpretorConfig(LlamaConfig, EditorConfig):
     compute_position_ids: bool = True
-    default_intervention_layer: int = 6
+    default_intervention_layer: int = 24
+    
+
+class LlamaModelWithCrossAttention(LlamaModel):
+    """
+    Transformer decoder consisting of *config.num_hidden_layers* layers. Each layer is a [`LlamaDecoderLayer`]
+
+    Args:
+        config: LlamaConfig
+    """
+
+    def __init__(self, config: LlamaConfig):
+        super().__init__(config)
+
+    def forward(
+        self,
+        input_ids: torch.LongTensor = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[List[torch.FloatTensor]] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+    ) -> Union[Tuple]:
+        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+        )
+        use_cache = use_cache if use_cache is not None else self.config.use_cache
+        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError(
+                "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
+            )
+
+        if self.gradient_checkpointing and self.training and use_cache:
+            use_cache = False
+
+        if inputs_embeds is None:
+            inputs_embeds = self.embed_tokens(input_ids)
+
+        past_seen_tokens = 0
+        if use_cache:  # kept for BC (cache positions)
+            if not isinstance(past_key_values, StaticCache):
+                past_key_values = DynamicCache.from_legacy_cache(past_key_values)
+                past_seen_tokens = past_key_values.get_seq_length()
+
+        if cache_position is None:
+            if isinstance(past_key_values, StaticCache):
+                raise ValueError("cache_position is a required argument when using StaticCache.")
+            cache_position = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            )
+
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
+
+        causal_mask = self._update_causal_mask(attention_mask, inputs_embeds, cache_position, past_seen_tokens)
+
+        # embed positions
+        hidden_states = inputs_embeds
+
+        # decoder layers
+        all_hidden_states = () if output_hidden_states else None
+        all_self_attns = () if output_attentions else None
+        next_decoder_cache = None
+
+        for decoder_layer in self.layers:
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
+
+            if self.gradient_checkpointing and self.training:
+                
+                if isinstance(decoder_layer, LlamaDecoderLayerWithCrossAttention):
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        causal_mask,
+                        encoder_hidden_states,
+                        encoder_attention_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                    )
+                else:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        causal_mask,
+                        position_ids,
+                        past_key_values,
+                        output_attentions,
+                        use_cache,
+                        cache_position,
+                    )
+            else:
+                if isinstance(decoder_layer, LlamaDecoderLayerWithCrossAttention):
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        encoder_hidden_states=encoder_hidden_states,
+                        encoder_attention_mask=encoder_attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
+
+            hidden_states = layer_outputs[0]
+
+            if use_cache:
+                next_decoder_cache = layer_outputs[2 if output_attentions else 1]
+
+            if output_attentions:
+                all_self_attns += (layer_outputs[1],)
+
+        hidden_states = self.norm(hidden_states)
+
+        # add hidden states from the last decoder layer
+        if output_hidden_states:
+            all_hidden_states += (hidden_states,)
+
+        next_cache = None
+        if use_cache:
+            next_cache = (
+                next_decoder_cache.to_legacy_cache() if isinstance(next_decoder_cache, Cache) else next_decoder_cache
+            )
+        if not return_dict:
+            return tuple(v for v in [hidden_states, next_cache, all_hidden_states, all_self_attns] if v is not None)
+        return BaseModelOutputWithPast(
+            last_hidden_state=hidden_states,
+            past_key_values=next_cache,
+            hidden_states=all_hidden_states,
+            attentions=all_self_attns,
+        )
 
 
-class GPT2InterpretorHypernetwork(GPT2LMHeadModel):
+class LlamaInterpretorHypernetwork(LlamaForCausalLM):
     _tied_weights_keys = []
 
-    def __init__(self, config: GPT2InterpretorConfig):
+    def __init__(self, config: LlamaInterpretorConfig):
         super().__init__(config)
-        self.transformer = GPT2Model(config)
-        
-        # only LM head gets special attention
-        if config._attn_implementation == "flash_attention_2":
-            _attention_cls = GPT2FlashAttention2
-        else:
-            _attention_cls = GPT2Attention
-
+        self.model = LlamaModelWithCrossAttention(config)
         self.lm_head = InterpretorUnembedCrossAttention(
             config=config, layer_idx=config.chop_editor_at_layer
         )
 
         # prune layers and add cross attn heads
-        self.transformer.h = self.transformer.h[: config.chop_editor_at_layer]
+        self.model.layers = self.model.layers[: config.chop_editor_at_layer]
         if config.cross_attn_layers == []:
             config.cross_attn_layers = list(range(config.chop_editor_at_layer))
 
-        for i, layer in enumerate(self.transformer.h):
+        for i, layer in enumerate(self.model.layers):
             if i not in config.cross_attn_layers:
                 continue
-            layer.crossattention = _attention_cls(
-                config=config, layer_idx=i, is_cross_attention=True
-            )
-            layer.ln_cross_attn = nn.LayerNorm(
-                config.hidden_size, eps=config.layer_norm_epsilon
-            )
-            original_query_weights = layer.attn.c_attn.weight[:, : config.hidden_size]
-            original_keys_values = layer.attn.c_attn.weight[:, config.hidden_size :]
-            original_query_bias = layer.attn.c_attn.bias[: config.hidden_size]
-            original_keys_values_bias = layer.attn.c_attn.bias[config.hidden_size :]
-
+            
+            self.model.layers[i] = LlamaDecoderLayerWithCrossAttention(config, i)
+            
+            original_q_weights = layer.self_attn.q_proj.weight
+            original_k_weights = layer.self_attn.k_proj.weight
+            original_v_weights = layer.self_attn.v_proj.weight
+            original_o_weights = layer.self_attn.out_proj.weight
+            
+            original_q_bias = layer.self_attn.q_proj.bias
+            original_k_bias = layer.self_attn.k_proj.bias
+            original_v_bias = layer.self_attn.v_proj.bias
+            original_o_bias = layer.self_attn.out_proj.bias
+            
+            original_mlp_gate_proj_weights = layer.mlp.gate_proj.weight
+            original_mlp_up_proj_weights = layer.mlp.up_proj.weight
+            original_mlp_down_proj_weights = layer.mlp.down_proj.weight
+            
+            original_input_layernorm_weights = layer.input_layernorm.weight
+            original_post_attention_layernorm = layer.post_attention_layernorm.weight
+            
             # with torch.no_grad():
             # Initialize the new layer with these parameters
-            layer.crossattention.q_attn.weight = nn.Parameter(original_query_weights)
-            layer.crossattention.q_attn.bias = nn.Parameter(original_query_bias)
-            layer.crossattention.c_attn.weight = nn.Parameter(original_keys_values)
-            layer.crossattention.c_attn.bias = nn.Parameter(original_keys_values_bias)
-
+            self.model.layers[i].self_attn.q_proj.weight = nn.Parameter(original_q_weights)
+            self.model.layers[i].self_attn.k_proj.weight = nn.Parameter(original_k_weights)
+            self.model.layers[i].self_attn.v_proj.weight = nn.Parameter(original_v_weights)
+            self.model.layers[i].self_attn.o_proj.weight = nn.Parameter(original_o_weights)
+            
+            self.model.layers[i].self_attn.q_proj.bias = nn.Parameter(original_q_bias)
+            self.model.layers[i].self_attn.k_proj.bias = nn.Parameter(original_k_bias)
+            self.model.layers[i].self_attn.v_proj.bias = nn.Parameter(original_v_bias)
+            self.model.layers[i].self_attn.o_proj.bias = nn.Parameter(original_o_bias)
+            
+            self.model.layers[i].mlp.gate_proj.weight = nn.Parameter(original_mlp_gate_proj_weights)
+            self.model.layers[i].mlp.up_proj.weight = nn.Parameter(original_mlp_up_proj_weights)
+            self.model.layers[i].mlp.down_proj.weight = nn.Parameter(original_mlp_down_proj_weights)
+            
+            self.model.layers[i].input_layernorm.weight = nn.Parameter(original_input_layernorm_weights)
+            self.model.layers[i].post_attention_layernorm.weight = nn.Parameter(original_post_attention_layernorm)
+            
         # Model parallel
         self.model_parallel = False
         self.device_map = None
@@ -123,13 +293,11 @@ class GPT2InterpretorHypernetwork(GPT2LMHeadModel):
             (base_encoder_attention_mask, source_encoder_attention_mask), dim=1
         )
 
-        transformer_outputs = self.transformer(
+        transformer_outputs = self.model(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
-            token_type_ids=token_type_ids,
             position_ids=position_ids,
-            head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=encoder_attention_mask,
@@ -160,12 +328,12 @@ class GPT2InterpretorHypernetwork(GPT2LMHeadModel):
         return reverse_attention_output
 
 
-class GPT2Interpretor(nn.Module):
-    def __init__(self, config: GPT2InterpretorConfig):
+class LlamaInterpretor(nn.Module):
+    def __init__(self, config: LlamaInterpretorConfig):
         super().__init__()
 
         self.config = config
-        self.hypernetwork = GPT2InterpretorHypernetwork(config)
+        self.hypernetwork = LlamaInterpretorHypernetwork(config)
         self.target_model = AutoModelForCausalLM.from_pretrained(
             config.name_or_path
         ).eval()
@@ -238,7 +406,6 @@ class GPT2Interpretor(nn.Module):
         source_hidden_states: torch.Tensor = None,
         source_position_ids: torch.Tensor = None,
         intervention_layer: int = None,
-        output_target_hidden_states: bool = False,
         output_edited_hidden_states: bool = False,
         output_intervention_ratio: bool = False,
         batch_intervention_ratio: torch.Tensor = None,
@@ -345,7 +512,7 @@ class GPT2Interpretor(nn.Module):
         if intervention_layer == 0:
             hooks = [(self.target_model.transformer.wte, embedding_representation_swap)]
         else:
-            hooks = [(self.target_model.transformer.h[intervention_layer - 1], representation_swap)]
+            hooks = [(self.target_model.model.layers[intervention_layer - 1], representation_swap)]
 
         with add_fwd_hooks(hooks):
             # THIS IS THE LINE WHERE THE MODEL IS CALLED (AND THE EDITOR IS CALLED AT
