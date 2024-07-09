@@ -23,7 +23,7 @@ from ..utils import (
     add_fwd_hooks,
     assign_layer_indices,
 )
-from .layers import InterpretorUnembedCrossAttention, LlamaDecoderLayerWithCrossAttention
+from .layers import InterpretorUnembedCrossAttention, LlamaDecoderLayerWithDoubleCrossAttention
 
 T = TypeVar("T", bound="LlamaInterpretor")
 
@@ -51,8 +51,10 @@ class LlamaModelWithCrossAttention(LlamaModel):
         self,
         input_ids: torch.LongTensor = None,
         attention_mask: Optional[torch.Tensor] = None,
-        encoder_hidden_states: Optional[torch.Tensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        source_hidden_states: Optional[torch.Tensor] = None,
+        source_attention_mask: Optional[torch.FloatTensor] = None,
+        base_hidden_states: Optional[torch.Tensor] = None,
+        base_attention_mask: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[torch.FloatTensor]] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
@@ -112,13 +114,15 @@ class LlamaModelWithCrossAttention(LlamaModel):
 
             if self.gradient_checkpointing and self.training:
                 
-                if isinstance(decoder_layer, LlamaDecoderLayerWithCrossAttention):
+                if isinstance(decoder_layer, LlamaDecoderLayerWithDoubleCrossAttention):
                     layer_outputs = self._gradient_checkpointing_func(
                         decoder_layer.__call__,
                         hidden_states,
                         causal_mask,
-                        encoder_hidden_states,
-                        encoder_attention_mask,
+                        source_hidden_states,
+                        source_attention_mask,
+                        base_hidden_states,
+                        base_attention_mask,
                         position_ids,
                         past_key_values,
                         output_attentions,
@@ -137,12 +141,14 @@ class LlamaModelWithCrossAttention(LlamaModel):
                         cache_position,
                     )
             else:
-                if isinstance(decoder_layer, LlamaDecoderLayerWithCrossAttention):
+                if isinstance(decoder_layer, LlamaDecoderLayerWithDoubleCrossAttention):
                     layer_outputs = decoder_layer(
                         hidden_states,
                         attention_mask=causal_mask,
-                        encoder_hidden_states=encoder_hidden_states,
-                        encoder_attention_mask=encoder_attention_mask,
+                        source_hidden_states=source_hidden_states,
+                        source_attention_mask=source_attention_mask,
+                        base_hidden_states=base_hidden_states,
+                        base_attention_mask=base_attention_mask,
                         position_ids=position_ids,
                         past_key_value=past_key_values,
                         output_attentions=output_attentions,
@@ -216,7 +222,7 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
             if i not in cross_attn_layers:
                 continue
             
-            self.model.layers[i] = LlamaDecoderLayerWithCrossAttention(config, i, add_cross_attention=True).to(dtype=config.torch_dtype)
+            self.model.layers[i] = LlamaDecoderLayerWithDoubleCrossAttention(config, i).to(dtype=config.torch_dtype)
             
             original_q_weights = layer.self_attn.q_proj.weight
             original_k_weights = layer.self_attn.k_proj.weight
@@ -238,20 +244,32 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
             self.model.layers[i].self_attn.k_proj.weight = nn.Parameter(original_k_weights)
             self.model.layers[i].self_attn.v_proj.weight = nn.Parameter(original_v_weights)
             self.model.layers[i].self_attn.o_proj.weight = nn.Parameter(original_o_weights)
-            self.model.layers[i].cross_attn.q_proj.weight = nn.Parameter(original_q_weights)
-            self.model.layers[i].cross_attn.k_proj.weight = nn.Parameter(original_k_weights)
-            self.model.layers[i].cross_attn.v_proj.weight = nn.Parameter(original_v_weights)
-            self.model.layers[i].cross_attn.o_proj.weight = nn.Parameter(original_o_weights)
+            
+            self.model.layers[i].source_cross_attn.q_proj.weight = nn.Parameter(original_q_weights)
+            self.model.layers[i].source_cross_attn.k_proj.weight = nn.Parameter(original_k_weights)
+            self.model.layers[i].source_cross_attn.v_proj.weight = nn.Parameter(original_v_weights)
+            self.model.layers[i].source_cross_attn.o_proj.weight = nn.Parameter(original_o_weights)
+            self.model.layers[i].source_cross_attn_input_layernorm.weight = nn.Parameter(original_input_layernorm_weights)
+            
+            self.model.layers[i].base_cross_attn.q_proj.weight = nn.Parameter(original_q_weights)
+            self.model.layers[i].base_cross_attn.k_proj.weight = nn.Parameter(original_k_weights)
+            self.model.layers[i].base_cross_attn.v_proj.weight = nn.Parameter(original_v_weights)
+            self.model.layers[i].base_cross_attn.o_proj.weight = nn.Parameter(original_o_weights)
+            self.model.layers[i].base_cross_attn_input_layernorm.weight = nn.Parameter(original_input_layernorm_weights)
             
             if config.attention_bias:
                 original_q_bias = layer.self_attn.q_proj.bias
                 original_k_bias = layer.self_attn.k_proj.bias
                 original_v_bias = layer.self_attn.v_proj.bias
                 original_o_bias = layer.self_attn.o_proj.bias
-                self.model.layers[i].cross_attn.q_proj.bias = nn.Parameter(original_q_bias)
-                self.model.layers[i].cross_attn.k_proj.bias = nn.Parameter(original_k_bias)
-                self.model.layers[i].cross_attn.v_proj.bias = nn.Parameter(original_v_bias)
-                self.model.layers[i].cross_attn.o_proj.bias = nn.Parameter(original_o_bias)
+                self.model.layers[i].source_cross_attn.q_proj.bias = nn.Parameter(original_q_bias)
+                self.model.layers[i].source_cross_attn.k_proj.bias = nn.Parameter(original_k_bias)
+                self.model.layers[i].source_cross_attn.v_proj.bias = nn.Parameter(original_v_bias)
+                self.model.layers[i].source_cross_attn.o_proj.bias = nn.Parameter(original_o_bias)
+                self.model.layers[i].base_cross_attn.q_proj.bias = nn.Parameter(original_q_bias)
+                self.model.layers[i].base_cross_attn.k_proj.bias = nn.Parameter(original_k_bias)
+                self.model.layers[i].base_cross_attn.v_proj.bias = nn.Parameter(original_v_bias)
+                self.model.layers[i].base_cross_attn.o_proj.bias = nn.Parameter(original_o_bias)
                 self.model.layers[i].self_attn.q_proj.bias = nn.Parameter(original_q_bias)
                 self.model.layers[i].self_attn.k_proj.bias = nn.Parameter(original_k_bias)
                 self.model.layers[i].self_attn.v_proj.bias = nn.Parameter(original_v_bias)
@@ -271,10 +289,10 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
         attention_mask: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        base_encoder_hidden_states: Optional[torch.Tensor] = None,
-        base_encoder_attention_mask: Optional[torch.FloatTensor] = None,
-        source_encoder_hidden_states: Optional[torch.Tensor] = None,
-        source_encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        base_hidden_states: Optional[torch.Tensor] = None,
+        base_attention_mask: Optional[torch.FloatTensor] = None,
+        source_hidden_states: Optional[torch.Tensor] = None,
+        source_attention_mask: Optional[torch.FloatTensor] = None,
         # labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
@@ -296,22 +314,16 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
         ):
             position_ids = attention_mask.cumsum(-1)
         
-        encoder_hidden_states = torch.cat(
-            (base_encoder_hidden_states, source_encoder_hidden_states), dim=1
-        )
-        
-        encoder_attention_mask = torch.cat(
-            (base_encoder_attention_mask, source_encoder_attention_mask), dim=1
-        )
-
         transformer_outputs = self.model(
             input_ids,
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_attention_mask,
+            base_hidden_states=base_hidden_states,
+            base_attention_mask=base_attention_mask,
+            source_hidden_states=source_hidden_states,
+            source_attention_mask=source_attention_mask,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
@@ -319,7 +331,7 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
         )
         
         hidden_states = transformer_outputs[0]
-
+        
         # Set device for model parallelism
         if self.model_parallel:
             torch.cuda.set_device(self.transformer.first_device)
@@ -328,10 +340,10 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
         reverse_attention_output = self.lm_head(
             hidden_states,
             attention_mask=attention_mask,
-            base_encoder_hidden_states=base_encoder_hidden_states,
-            base_encoder_attention_mask=base_encoder_attention_mask,
-            source_encoder_hidden_states=source_encoder_hidden_states,
-            source_encoder_attention_mask=source_encoder_attention_mask,
+            base_encoder_hidden_states=base_hidden_states,
+            base_encoder_attention_mask=base_attention_mask,
+            source_encoder_hidden_states=source_hidden_states,
+            source_encoder_attention_mask=source_attention_mask,
             output_attentions=output_attentions,
         )
 
@@ -486,10 +498,10 @@ class LlamaInterpretor(nn.Module):
             interpretor_output = self.hypernetwork(
                 input_ids=editor_input_ids,
                 attention_mask=editor_attention_mask,
-                base_encoder_hidden_states=collapsed_base_hidden_states,
-                base_encoder_attention_mask=collapsed_base_attention_mask,
-                source_encoder_hidden_states=collapsed_source_hidden_states,
-                source_encoder_attention_mask=collapsed_source_attention_mask,
+                base_hidden_states=collapsed_base_hidden_states,
+                base_attention_mask=collapsed_base_attention_mask,
+                source_hidden_states=collapsed_source_hidden_states,
+                source_attention_mask=collapsed_source_attention_mask,
             )
 
             # Multiply the outputs by normalization factors

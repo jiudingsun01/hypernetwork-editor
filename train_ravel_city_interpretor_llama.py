@@ -1,8 +1,7 @@
 max_grad_clip = 4.0
-lr = 3e-5
+lr = 1e-4
 
 import torch
-import wandb
 
 torch.manual_seed(42)
 # torch.set_default_device("cuda")
@@ -19,6 +18,14 @@ import time
 import sys
 
 # sys.path.append("..")
+
+import wandb
+
+wandb.init(
+    project="hypernetworks-interp",
+    config={"targetmodel": "llama3-8b", "editormodel": "llama3-8b", "dataset": "ravel"},
+)
+
 
 from transformers import PreTrainedTokenizerFast, AutoTokenizer
 # tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v0.1")
@@ -153,8 +160,8 @@ def generate_ravel_dataset(n_samples, split="train", domains=["city"], domain_ex
     dataset = Dataset.from_list(dataset)
     return dataset
 
-city_train_set = generate_ravel_dataset(10000, split="train", filtering_dict_paths=["./notebooks/ravel_llama-3-8b_city_prompt_to_output_statistics.json"])
-city_test_set =  generate_ravel_dataset(1000, split="test", filtering_dict_paths=["./notebooks/ravel_llama-3-8b_city_prompt_to_output_statistics.json"])
+city_train_set = generate_ravel_dataset(20480, split="train", filtering_dict_paths=["./notebooks/ravel_llama-3-8b_city_prompt_to_output_statistics.json"])
+city_test_set =  generate_ravel_dataset(1024, split="test", filtering_dict_paths=["./notebooks/ravel_llama-3-8b_city_prompt_to_output_statistics.json"])
 
 def ravel_collate_fn(batch):
     
@@ -229,7 +236,7 @@ def ravel_collate_fn(batch):
     
     return returned_dict
 
-batch_size = 32  # 50 or so
+batch_size = 16  # 50 or so
 data_loader = DataLoader(
     city_train_set, batch_size=batch_size, collate_fn=ravel_collate_fn, shuffle=True
 )  # batch_size, collate_fn=collate_fn)
@@ -562,7 +569,7 @@ hypernetwork = hypernetwork.to("cuda")
 hypernetwork.run_train(
     train_loader=data_loader,
     test_loader=test_data_loader,
-    epochs=3,
+    epochs=15,
     eval_per_steps = 50,
     use_unaffected=False
 )
