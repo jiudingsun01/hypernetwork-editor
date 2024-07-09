@@ -19,8 +19,7 @@ from transformers.cache_utils import StaticCache, DynamicCache, Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
 
 from ..utils import (
-    EditorConfig,
-    EditorModelOutput,
+    InterpretorModelOutput,
     add_fwd_hooks,
     assign_layer_indices,
 )
@@ -29,7 +28,10 @@ from .layers import InterpretorUnembedCrossAttention, LlamaDecoderLayerWithCross
 T = TypeVar("T", bound="LlamaInterpretor")
 
 
-class LlamaInterpretorConfig(LlamaConfig, EditorConfig):
+class LlamaInterpretorConfig(LlamaConfig):
+    torch_dtype = torch.bfloat16
+    chop_editor_at_layer: int = -1
+    num_editing_heads: int = 32
     compute_position_ids: bool = True
     default_intervention_layer: int = 24
     
@@ -192,31 +194,35 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
 
     def __init__(self, config: LlamaInterpretorConfig):
         super().__init__(config)
-        self.model = LlamaModelWithCrossAttention(config)
+        self.model = LlamaModelWithCrossAttention.from_pretrained(
+            config.name_or_path, torch_dtype = config.torch_dtype
+        )
+        
         self.lm_head = InterpretorUnembedCrossAttention(
             config=config, layer_idx=config.chop_editor_at_layer
-        )
+        ).to(dtype=config.torch_dtype)
+        
+        # Model parallel
+        self.model_parallel = False
+        self.device_map = None
+        # Initialize weights and apply final processing
+        self.post_init()
 
         # prune layers and add cross attn heads
         self.model.layers = self.model.layers[: config.chop_editor_at_layer]
-        if config.cross_attn_layers == []:
-            config.cross_attn_layers = list(range(config.chop_editor_at_layer))
-
+        cross_attn_layers = list(range(config.chop_editor_at_layer))
+        
         for i, layer in enumerate(self.model.layers):
-            if i not in config.cross_attn_layers:
+            if i not in cross_attn_layers:
                 continue
             
-            self.model.layers[i] = LlamaDecoderLayerWithCrossAttention(config, i)
+            self.model.layers[i] = LlamaDecoderLayerWithCrossAttention(config, i, add_cross_attention=True).to(dtype=config.torch_dtype)
             
             original_q_weights = layer.self_attn.q_proj.weight
             original_k_weights = layer.self_attn.k_proj.weight
             original_v_weights = layer.self_attn.v_proj.weight
-            original_o_weights = layer.self_attn.out_proj.weight
+            original_o_weights = layer.self_attn.o_proj.weight
             
-            original_q_bias = layer.self_attn.q_proj.bias
-            original_k_bias = layer.self_attn.k_proj.bias
-            original_v_bias = layer.self_attn.v_proj.bias
-            original_o_bias = layer.self_attn.out_proj.bias
             
             original_mlp_gate_proj_weights = layer.mlp.gate_proj.weight
             original_mlp_up_proj_weights = layer.mlp.up_proj.weight
@@ -225,17 +231,31 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
             original_input_layernorm_weights = layer.input_layernorm.weight
             original_post_attention_layernorm = layer.post_attention_layernorm.weight
             
+            
             # with torch.no_grad():
             # Initialize the new layer with these parameters
             self.model.layers[i].self_attn.q_proj.weight = nn.Parameter(original_q_weights)
             self.model.layers[i].self_attn.k_proj.weight = nn.Parameter(original_k_weights)
             self.model.layers[i].self_attn.v_proj.weight = nn.Parameter(original_v_weights)
             self.model.layers[i].self_attn.o_proj.weight = nn.Parameter(original_o_weights)
+            self.model.layers[i].cross_attn.q_proj.weight = nn.Parameter(original_q_weights)
+            self.model.layers[i].cross_attn.k_proj.weight = nn.Parameter(original_k_weights)
+            self.model.layers[i].cross_attn.v_proj.weight = nn.Parameter(original_v_weights)
+            self.model.layers[i].cross_attn.o_proj.weight = nn.Parameter(original_o_weights)
             
-            self.model.layers[i].self_attn.q_proj.bias = nn.Parameter(original_q_bias)
-            self.model.layers[i].self_attn.k_proj.bias = nn.Parameter(original_k_bias)
-            self.model.layers[i].self_attn.v_proj.bias = nn.Parameter(original_v_bias)
-            self.model.layers[i].self_attn.o_proj.bias = nn.Parameter(original_o_bias)
+            if config.attention_bias:
+                original_q_bias = layer.self_attn.q_proj.bias
+                original_k_bias = layer.self_attn.k_proj.bias
+                original_v_bias = layer.self_attn.v_proj.bias
+                original_o_bias = layer.self_attn.o_proj.bias
+                self.model.layers[i].cross_attn.q_proj.bias = nn.Parameter(original_q_bias)
+                self.model.layers[i].cross_attn.k_proj.bias = nn.Parameter(original_k_bias)
+                self.model.layers[i].cross_attn.v_proj.bias = nn.Parameter(original_v_bias)
+                self.model.layers[i].cross_attn.o_proj.bias = nn.Parameter(original_o_bias)
+                self.model.layers[i].self_attn.q_proj.bias = nn.Parameter(original_q_bias)
+                self.model.layers[i].self_attn.k_proj.bias = nn.Parameter(original_k_bias)
+                self.model.layers[i].self_attn.v_proj.bias = nn.Parameter(original_v_bias)
+                self.model.layers[i].self_attn.o_proj.bias = nn.Parameter(original_o_bias)
             
             self.model.layers[i].mlp.gate_proj.weight = nn.Parameter(original_mlp_gate_proj_weights)
             self.model.layers[i].mlp.up_proj.weight = nn.Parameter(original_mlp_up_proj_weights)
@@ -243,21 +263,13 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
             
             self.model.layers[i].input_layernorm.weight = nn.Parameter(original_input_layernorm_weights)
             self.model.layers[i].post_attention_layernorm.weight = nn.Parameter(original_post_attention_layernorm)
-            
-        # Model parallel
-        self.model_parallel = False
-        self.device_map = None
-        # Initialize weights and apply final processing
-        self.post_init()
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[Tuple[Tuple[torch.Tensor]]] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
-        token_type_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         base_encoder_hidden_states: Optional[torch.Tensor] = None,
         base_encoder_attention_mask: Optional[torch.FloatTensor] = None,
@@ -265,7 +277,6 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
         source_encoder_attention_mask: Optional[torch.FloatTensor] = None,
         # labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
-        output_intervention_ratio: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
@@ -335,8 +346,8 @@ class LlamaInterpretor(nn.Module):
         self.config = config
         self.hypernetwork = LlamaInterpretorHypernetwork(config)
         self.target_model = AutoModelForCausalLM.from_pretrained(
-            config.name_or_path
-        ).eval()
+            config.name_or_path, torch_dtype = config.torch_dtype
+        )
 
         # freeze target model
         for param in self.target_model.parameters():
@@ -344,7 +355,7 @@ class LlamaInterpretor(nn.Module):
 
         assign_layer_indices(self.target_model)
 
-        if config.use_layerwise_embeddings:
+        """if config.use_layerwise_embeddings:
             # extra layer is cross-attn in the lm_head
             self.layerwise_embeddings = nn.Parameter(
                 torch.zeros(config.n_layer + 1, config.n_embd), requires_grad=True
@@ -352,8 +363,9 @@ class LlamaInterpretor(nn.Module):
             self.layerwise_embeddings.data.normal_(
                 mean=0.0, std=self.target_model.config.initializer_range
             )
-        else:
-            self.layerwise_embeddings = None
+        else:"""
+        
+        self.layerwise_embeddings = None
 
     def train(self: T, mode: bool = True) -> T:
         return self.hypernetwork.train(mode)
@@ -409,7 +421,7 @@ class LlamaInterpretor(nn.Module):
         output_edited_hidden_states: bool = False,
         output_intervention_ratio: bool = False,
         batch_intervention_ratio: torch.Tensor = None,
-    ) -> EditorModelOutput:
+    ) -> InterpretorModelOutput:
         
         if intervention_layer is None:
             intervention_layer = self.config.default_intervention_layer        
@@ -478,13 +490,11 @@ class LlamaInterpretor(nn.Module):
                 base_encoder_attention_mask=collapsed_base_attention_mask,
                 source_encoder_hidden_states=collapsed_source_hidden_states,
                 source_encoder_attention_mask=collapsed_source_attention_mask,
-                output_intervention_ratio=output_intervention_ratio,
             )
 
             # Multiply the outputs by normalization factors
-            intervention_output, _, batch_intervention_ratio = interpretor_output
-            
-            batch_intervention_ratio = batch_intervention_ratio.squeeze()
+            _, batch_intervention_weights, _ = interpretor_output
+            batch_intervention_weights = batch_intervention_weights.squeeze()
             
             
         source_output = self.target_model(
@@ -494,19 +504,19 @@ class LlamaInterpretor(nn.Module):
         )
         
         source_hidden_states = source_output.hidden_states[intervention_layer]
-        intervention_matrix = torch.einsum("bij,bid->bijd", batch_intervention_ratio, source_hidden_states)
-        intervention_matrix = intervention_matrix.sum(dim=1)
-        base_intervention_weights = torch.sum(batch_intervention_ratio, dim=1)
+        intervention_matrix = torch.einsum("bij,bid->bijd", batch_intervention_weights[:, :-1, :], source_hidden_states) # TODO: Fix it to help the new implement 
+        intervention_matrix = intervention_matrix.sum(dim=1) 
         
         # Run target model with edit vectors.
         # This adds the edit vectors to the given hidden state at the specified batch index, position, and layer
         def representation_swap(module, input, output):
-            res_diff = torch.einsum("bid,bi->bid", output[0].clone(), base_intervention_weights)
+            base_hidden_states = output[0].clone()
+            base_intervention_weights = batch_intervention_weights[:, -1, :]
+            res_diff = torch.einsum("bid,bi->bid", base_hidden_states, (1 - base_intervention_weights))
             output[0][:] += (intervention_matrix - res_diff)
             
         def embedding_representation_swap(module, input, output):
-            res_diff = torch.einsum("bid,bi->bid", output.clone(), base_intervention_weights)
-            output[:] += (intervention_matrix - res_diff)          
+            raise NotImplementedError("Embedding representation swap is not implemented yet")         
         
         # Now editing the target model
         if intervention_layer == 0:
@@ -526,7 +536,7 @@ class LlamaInterpretor(nn.Module):
     
         logits = target_result.logits
         
-        output = EditorModelOutput(logits=logits)
+        output = InterpretorModelOutput(logits=logits, intervention_weights=batch_intervention_weights)
         if output_edited_hidden_states:
             output.edited_hidden_states = target_result.hidden_states
         return output

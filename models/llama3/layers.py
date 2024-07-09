@@ -6,13 +6,9 @@ import torch.nn as nn
 from torch.cuda.amp import autocast
 from transformers.models.llama.modeling_llama import (
     LlamaAttention,
-    LlamaFlashAttention2,
-    LlamaSdpaAttention,
     LlamaConfig,
-    LlamaMLP,
     LlamaRMSNorm,
     LlamaDecoderLayer,
-    LlamaRotaryEmbedding,
     apply_rotary_pos_emb,
     repeat_kv
 )
@@ -21,9 +17,9 @@ import math
 
 import torch.nn.functional as F
 from transformers.cache_utils import Cache
-from transformers.pytorch_utils import Conv1D
 
 from .config import LlamaEditorConfig
+from ..utils import apply_rotary_pos_emb_single_attn
 
 
 class LlamaAttentionWithCrossAttention(LlamaAttention):
@@ -47,6 +43,7 @@ class LlamaAttentionWithCrossAttention(LlamaAttention):
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()    
+        _, kv_len, _ = encoder_hidden_states.size()
 
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
@@ -56,42 +53,52 @@ class LlamaAttentionWithCrossAttention(LlamaAttention):
             key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
             value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
             
-            if self.is_cross_attention:
-                assert encoder_hidden_states is not None, "Cross attention requires encoder_hidden_states"
-                query_states = [F.linear(encoder_hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
-                attention_mask = encoder_attention_mask
-            else:
-                query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
+            
+            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
             query_states = torch.cat(query_states, dim=-1)
             
-
-            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
-            key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
-            value_states = torch.cat(value_states, dim=-1)
-        else:
             if self.is_cross_attention:
                 assert encoder_hidden_states is not None, "Cross attention requires encoder_hidden_states"
-                query_states = self.q_proj(encoder_hidden_states)
+                key_states = [F.linear(encoder_hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
+                value_states = [F.linear(encoder_hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
                 attention_mask = encoder_attention_mask
+                kv_position_ids = torch.arange(kv_len, device=hidden_states.device).unsqueeze(0).expand(bsz, -1)
             else:
-                query_states = self.q_proj(hidden_states)
+                key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
+                value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
                 
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            key_states = torch.cat(key_states, dim=-1)
+            value_states = torch.cat(value_states, dim=-1)
+        else:
+            query_states = self.q_proj(hidden_states)
+            if self.is_cross_attention:
+                assert encoder_hidden_states is not None, "Cross attention requires encoder_hidden_states"
+                key_states = self.k_proj(encoder_hidden_states)
+                value_states = self.v_proj(encoder_hidden_states)
+                attention_mask = encoder_attention_mask
+                kv_position_ids = torch.arange(kv_len, device=hidden_states.device).unsqueeze(0).expand(bsz, -1)
+            else:
+                key_states = self.k_proj(hidden_states)
+                value_states = self.v_proj(hidden_states)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, kv_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, kv_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
 
         past_key_value = getattr(self, "past_key_value", past_key_value)
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        
+        if self.is_cross_attention:
+            q_cos, q_sin = self.rotary_emb(query_states, position_ids)
+            query_states = apply_rotary_pos_emb_single_attn(query_states, q_cos, q_sin)
+            kv_cos, kv_sin = self.rotary_emb(value_states, kv_position_ids)
+            key_states = apply_rotary_pos_emb_single_attn(key_states, kv_cos, kv_sin)
+        else:
+            cos, sin = self.rotary_emb(value_states, position_ids)
+            query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            cache_kwargs = {}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
@@ -99,7 +106,7 @@ class LlamaAttentionWithCrossAttention(LlamaAttention):
 
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
-        if attention_mask is not None:  # no matter the length, we just slice it
+        if attention_mask is not None and not self.is_cross_attention:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
 
@@ -229,11 +236,10 @@ class LlamaDecoderLayerWithCrossAttention(LlamaDecoderLayer):
 class InterpretorUnembedCrossAttention(LlamaAttentionWithCrossAttention):
     _flash_attn_enabled = False
     
-    def __init__(self, config: LlamaEditorConfig, layer_idx=None, is_cross_attention=False):
-        super().__init__(config, layer_idx, is_cross_attention)
+    def __init__(self, config: LlamaEditorConfig, layer_idx=None):
+        super().__init__(config, layer_idx, True)
         self.intervention_layer = config.default_intervention_layer
-        self.q_combine = nn.Linear(self.embed_dim, self.embed_dim * 2, bias=False)
-        self.q_combine.weight = nn.Parameter(torch.randn(self.embed_dim, self.embed_dim * 2))
+        self.q_combine = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
         nn.init.uniform_(self.q_combine.weight)
         
     def forward(
@@ -246,8 +252,6 @@ class InterpretorUnembedCrossAttention(LlamaAttentionWithCrossAttention):
         source_encoder_attention_mask: Optional[torch.FloatTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
         cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
@@ -261,7 +265,7 @@ class InterpretorUnembedCrossAttention(LlamaAttentionWithCrossAttention):
             raise ValueError("This class is only meant to be used as cross attention")
             # query, key, value = self.c_attn(hidden_states).split(self.split_size, dim=2)
         
-        n_layers = self.config.n_layer + 1
+        n_layers = self.config.num_hidden_layers + 1
         base_n_tokens = base_encoder_attention_mask.shape[-1] // n_layers
         source_n_tokens = source_encoder_attention_mask.shape[-1] // n_layers
         
@@ -285,102 +289,77 @@ class InterpretorUnembedCrossAttention(LlamaAttentionWithCrossAttention):
         
         encoder_hidden_states = torch.concat([expanded_base_encoder_hidden_states, expanded_source_encoder_hidden_states], dim=-1)
         encoder_hidden_states = self.q_combine(encoder_hidden_states)
-        
+        encoder_hidden_states = torch.concat([encoder_hidden_states, base_encoder_hidden_states.unsqueeze(1)], dim=1)
+
         encoder_attention_mask = torch.einsum("bq,bs->bsq", base_encoder_attention_mask, source_encoder_attention_mask)
-                
-        batch_size, source_n_tokens, base_n_tokens = encoder_attention_mask.shape
+        encoder_attention_mask = torch.concat([encoder_attention_mask, torch.ones_like(base_encoder_attention_mask).unsqueeze(1)], dim=1)
+        
+        batch_size, _, _ = encoder_attention_mask.shape
         
         encoder_hidden_states = encoder_hidden_states.reshape(
             batch_size, 
-            source_n_tokens * base_n_tokens,
+            (source_n_tokens + 1) * base_n_tokens,
             -1
         )
         
         encoder_attention_mask = encoder_attention_mask.reshape(
             batch_size,
-            source_n_tokens * base_n_tokens
+            (source_n_tokens + 1) * base_n_tokens
         )
         
-        bsz, q_len, _ = hidden_states.size()    
-
+        bsz, q_len, _ = hidden_states.size()
+        _, kv_len, _ = encoder_hidden_states.size()
+        
+        if position_ids is None:
+            position_ids = torch.arange(q_len, device=hidden_states.device).unsqueeze(0).expand(bsz, -1)
+            
         if self.config.pretraining_tp > 1:
             key_value_slicing = (self.num_key_value_heads * self.head_dim) // self.config.pretraining_tp
             query_slices = self.q_proj.weight.split(
                 (self.num_heads * self.head_dim) // self.config.pretraining_tp, dim=0
             )
             key_slices = self.k_proj.weight.split(key_value_slicing, dim=0)
-            value_slices = self.v_proj.weight.split(key_value_slicing, dim=0)
             
-            if self.is_cross_attention:
-                assert encoder_hidden_states is not None, "Cross attention requires encoder_hidden_states"
-                query_states = [F.linear(encoder_hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
-                attention_mask = encoder_attention_mask
-            else:
-                query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
+            assert encoder_hidden_states is not None, "Cross attention requires encoder_hidden_states"
+            query_states = [F.linear(hidden_states, query_slices[i]) for i in range(self.config.pretraining_tp)]
             query_states = torch.cat(query_states, dim=-1)
             
-
-            key_states = [F.linear(hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
+            key_position_ids = torch.arange(kv_len, device=encoder_hidden_states.device).unsqueeze(0).expand(bsz, -1)
+            key_states = [F.linear(encoder_hidden_states, key_slices[i]) for i in range(self.config.pretraining_tp)]
             key_states = torch.cat(key_states, dim=-1)
-
-            value_states = [F.linear(hidden_states, value_slices[i]) for i in range(self.config.pretraining_tp)]
-            value_states = torch.cat(value_states, dim=-1)
         else:
-            if self.is_cross_attention:
-                assert encoder_hidden_states is not None, "Cross attention requires encoder_hidden_states"
-                query_states = self.q_proj(encoder_hidden_states)
-                attention_mask = encoder_attention_mask
-            else:
-                query_states = self.q_proj(hidden_states)
-                
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
+            assert encoder_hidden_states is not None, "Cross attention requires encoder_hidden_states"
+            query_states = self.q_proj(hidden_states)    
+            key_states = self.k_proj(encoder_hidden_states)
+            key_position_ids = torch.arange(kv_len, device=encoder_hidden_states.device).unsqueeze(0).expand(bsz, -1)
 
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
-        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
+        key_states = key_states.view(bsz, kv_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         past_key_value = getattr(self, "past_key_value", past_key_value)
-        cos, sin = self.rotary_emb(value_states, position_ids)
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
-
+        
+        q_cos, q_sin = self.rotary_emb(query_states, position_ids)
+        query_states = apply_rotary_pos_emb_single_attn(query_states, q_cos, q_sin)
+        kv_cos, kv_sin = self.rotary_emb(key_states, key_position_ids)
+        key_states = apply_rotary_pos_emb_single_attn(key_states, kv_cos, kv_sin)
+            
         if past_key_value is not None:
+            raise NotImplementedError
             # sin and cos are specific to RoPE models; cache_position needed for the static cache
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
             key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
-        value_states = repeat_kv(value_states, self.num_key_value_groups)
-
+        
+        query_states = query_states[:, :, -1, :].unsqueeze(2) # Take the last token from the editor instruction
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(self.head_dim)
 
+        """
         if attention_mask is not None:  # no matter the length, we just slice it
             causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
             attn_weights = attn_weights + causal_mask
-
-        # upcast attention to fp32
-        attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-        attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
-        attn_output = torch.matmul(attn_weights, value_states)
-
-        if attn_output.size() != (bsz, self.num_heads, q_len, self.head_dim):
-            raise ValueError(
-                f"`attn_output` should be of size {(bsz, self.num_heads, q_len, self.head_dim)}, but is"
-                f" {attn_output.size()}"
-            )
-
-        attn_output = attn_output.transpose(1, 2).contiguous()
-
-        attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
-
-        if self.config.pretraining_tp > 1:
-            attn_output = attn_output.split(self.hidden_size // self.config.pretraining_tp, dim=2)
-            o_proj_slices = self.o_proj.weight.split(self.hidden_size // self.config.pretraining_tp, dim=1)
-            attn_output = sum([F.linear(attn_output[i], o_proj_slices[i]) for i in range(self.config.pretraining_tp)])
-        else:
-            attn_output = self.o_proj(attn_output)
-
-        if not output_attentions:
-            attn_weights = None
-
-        return attn_output, attn_weights, past_key_value
+        """
+        attn_weights = torch.mean(attn_weights, dim=1, keepdim=False)
+        attn_weights = attn_weights.view(bsz, 1, source_n_tokens + 1, base_n_tokens).squeeze()
+        attn_weights = nn.functional.softmax(attn_weights, dim=1, dtype=torch.float32).to(query_states.dtype)
+        
+        return None, attn_weights, past_key_value
