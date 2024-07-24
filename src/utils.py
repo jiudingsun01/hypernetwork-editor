@@ -66,7 +66,8 @@ class InterpretorModelOutput(BaseModelOutput):
     logits: Optional[torch.Tensor] = None
     target_hidden_states: Optional[torch.Tensor] = None
     edited_hidden_states: Optional[torch.Tensor] = None
-    intervention_weights: Optional[torch.Tensor] = None
+    intervention_weight: Optional[torch.Tensor] = None
+    loss: Optional[torch.Tensor] = None
 
 
 @contextlib.contextmanager
@@ -101,3 +102,4 @@ def assign_layer_indices(model):
             layer.layer_index = i + 1
     elif "llama" in model.config.name_or_path:
         pass
+    

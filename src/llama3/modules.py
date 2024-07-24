@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from typing import Any, List, Mapping, Optional, Tuple, TypeVar, Union
-
+import wandb
+import os
 import torch
 import torch.nn as nn
 from transformers import (
@@ -9,11 +10,9 @@ from transformers import (
     LlamaConfig,
     LlamaModel,
     LlamaForCausalLM,
+    AutoTokenizer
 )
-from transformers.models.llama.modeling_llama import (
-    LlamaAttention,
-    LlamaFlashAttention2,
-)
+
 
 from transformers.cache_utils import StaticCache, DynamicCache, Cache
 from transformers.modeling_outputs import BaseModelOutputWithPast
@@ -24,6 +23,12 @@ from ..utils import (
     assign_layer_indices,
 )
 from .layers import InterpretorUnembedCrossAttention, LlamaDecoderLayerWithDoubleCrossAttention
+from tqdm import tqdm
+from torch import optim
+import matplotlib.pyplot as plt
+import seaborn as sns
+import time
+
 
 T = TypeVar("T", bound="LlamaInterpretor")
 
@@ -33,7 +38,7 @@ class LlamaInterpretorConfig(LlamaConfig):
     chop_editor_at_layer: int = -1
     num_editing_heads: int = 32
     compute_position_ids: bool = True
-    default_intervention_layer: int = 24
+    intervention_layer: int = 24
     
 
 class LlamaModelWithCrossAttention(LlamaModel):
@@ -431,12 +436,16 @@ class LlamaInterpretor(nn.Module):
         source_position_ids: torch.Tensor = None,
         intervention_layer: int = None,
         output_edited_hidden_states: bool = False,
-        output_intervention_ratio: bool = False,
-        batch_intervention_ratio: torch.Tensor = None,
+        output_intervention_weight: bool = True,
+        intervention_weight: torch.Tensor = None,
+        inference_mode: str = None,
     ) -> InterpretorModelOutput:
         
+        assert inference_mode in [None, "column_argmax", "global_argmax", "groundtruth"]
+        
+                
         if intervention_layer is None:
-            intervention_layer = self.config.default_intervention_layer        
+            intervention_layer = self.config.intervention_layer        
         
         # Run target model for encoded hidden states
         if base_hidden_states is None:
@@ -464,17 +473,7 @@ class LlamaInterpretor(nn.Module):
         source_normalization_factors = source_hidden_states.norm(dim=-1, keepdim=True)
         source_hidden_states = source_hidden_states / source_normalization_factors
 
-        # Error catching:
-        
-        # batch_intervention_ratio = (batch_size, source_token_sequence_length, base_token_sequence_length)
-        if batch_intervention_ratio is not None:
-            if output_intervention_ratio:
-                raise ValueError(
-                    "Inputting your own batch_intervention_ratio means the model does not construct the outputs you are requesting"
-                )
-
-        # Run editor model, get edit vectors
-        if batch_intervention_ratio is None:
+        if intervention_weight is None:
             
             n_layer = base_hidden_states.shape[2]
             
@@ -505,9 +504,25 @@ class LlamaInterpretor(nn.Module):
             )
 
             # Multiply the outputs by normalization factors
-            _, batch_intervention_weights, _ = interpretor_output
-            batch_intervention_weights = batch_intervention_weights.squeeze()
+            _, intervention_weight, _ = interpretor_output
+            intervention_weight = intervention_weight.squeeze()
             
+        
+        if inference_mode == "global_argmax":
+            batch_size, _, num_base_pos = intervention_weight.shape
+            source_base_intervention_flatten = intervention_weight[:, :-1, :].view(batch_size, -1)
+            max_intervention_position = torch.argmax(source_base_intervention_flatten, dim=1)
+            intervention_weight = torch.zeros_like(intervention_weight)
+            intervention_weight[:, -1, :] = 1.0
+            for i in range(batch_size):
+                source_token_idx = max_intervention_position[i] // num_base_pos
+                base_token_idx = max_intervention_position[i] % num_base_pos
+                intervention_weight[i, source_token_idx, base_token_idx] = 1.0
+                intervention_weight[i, -1, base_token_idx] = 0.0
+        elif inference_mode == "column_argmax":
+            batch_size, num_src_pos, num_base_pos = intervention_weight.shape
+            intervention_weight = torch.argmax(intervention_weight, dim=1)
+            intervention_weight = torch.nn.functional.one_hot(intervention_weight, num_classes=num_src_pos).float().permute(0, 2, 1)            
             
         source_output = self.target_model(
             input_ids=source_input_ids,
@@ -516,23 +531,26 @@ class LlamaInterpretor(nn.Module):
         )
         
         source_hidden_states = source_output.hidden_states[intervention_layer]
-        intervention_matrix = torch.einsum("bij,bid->bijd", batch_intervention_weights[:, :-1, :], source_hidden_states) # TODO: Fix it to help the new implement 
+        intervention_matrix = torch.einsum("bij,bid->bijd", intervention_weight[:, :-1, :], source_hidden_states) # TODO: Fix it to help the new implement 
         intervention_matrix = intervention_matrix.sum(dim=1) 
         
         # Run target model with edit vectors.
         # This adds the edit vectors to the given hidden state at the specified batch index, position, and layer
         def representation_swap(module, input, output):
             base_hidden_states = output[0].clone()
-            base_intervention_weights = batch_intervention_weights[:, -1, :]
-            res_diff = torch.einsum("bid,bi->bid", base_hidden_states, (1 - base_intervention_weights))
+            base_intervention_weight = intervention_weight[:, -1, :]
+            res_diff = torch.einsum("bid,bi->bid", base_hidden_states, (1 - base_intervention_weight))
             output[0][:] += (intervention_matrix - res_diff)
             
         def embedding_representation_swap(module, input, output):
-            raise NotImplementedError("Embedding representation swap is not implemented yet")         
+            base_hidden_states = output.clone()
+            base_intervention_weight = intervention_weight[:, -1, :]
+            res_diff = torch.einsum("bid,bi->bid", base_hidden_states, (1 - base_intervention_weight))
+            output += (intervention_matrix - res_diff)    
         
         # Now editing the target model
         if intervention_layer == 0:
-            hooks = [(self.target_model.transformer.wte, embedding_representation_swap)]
+            hooks = [(self.target_model.model.embed_tokens, embedding_representation_swap)]
         else:
             hooks = [(self.target_model.model.layers[intervention_layer - 1], representation_swap)]
 
@@ -548,7 +566,12 @@ class LlamaInterpretor(nn.Module):
     
         logits = target_result.logits
         
-        output = InterpretorModelOutput(logits=logits, intervention_weights=batch_intervention_weights)
+        output = InterpretorModelOutput(logits=logits)
         if output_edited_hidden_states:
             output.edited_hidden_states = target_result.hidden_states
+            
+        if output_intervention_weight:
+            output.intervention_weight = intervention_weight
+
         return output
+    

@@ -34,11 +34,11 @@ def run_experiment(intervention_layer=6):
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
 
-    city_dataset = load_from_disk("./data/ravel/city_disentangling")
+    city_dataset = load_from_disk("./data/ravel/city_one_token")
     train_set = city_dataset["train"]
     test_set = city_dataset["test"]
 
-    collate_fn = get_ravel_collate_fn(tokenizer, disentangling=True)
+    collate_fn = get_ravel_collate_fn(tokenizer)
 
     batch_size = 32  # 50 or so
     data_loader = DataLoader(
@@ -68,8 +68,8 @@ def run_experiment(intervention_layer=6):
         test_loader=test_data_loader,
         epochs=50,
         eval_per_steps = 100,
-        disentangling=True,
-        save_dir=f"./ravel_city_layer_{intervention_layer}_disentangling",
+        disentangling=False,
+        save_dir=f"./ravel_city_layer_{intervention_layer}_one_token",
         weight_decay=0.01, 
         lr=3e-5
     )

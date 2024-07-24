@@ -18,7 +18,6 @@ import math
 import torch.nn.functional as F
 from transformers.cache_utils import Cache
 
-from .config import LlamaEditorConfig
 from ..utils import apply_rotary_pos_emb_single_attn
 
 
@@ -345,9 +344,9 @@ class LlamaDecoderLayerWithCrossAttention(LlamaDecoderLayer):
 class InterpretorUnembedCrossAttention(LlamaAttentionWithCrossAttention):
     _flash_attn_enabled = False
     
-    def __init__(self, config: LlamaEditorConfig, layer_idx=None):
+    def __init__(self, config, layer_idx=None):
         super().__init__(config, layer_idx, True)
-        self.intervention_layer = config.default_intervention_layer
+        self.intervention_layer = config.intervention_layer
         self.q_combine = nn.Linear(self.hidden_size * 2, self.hidden_size, bias=False)
         nn.init.uniform_(self.q_combine.weight)
         
