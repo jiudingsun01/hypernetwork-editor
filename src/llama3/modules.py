@@ -23,6 +23,8 @@ from ..utils import (
     assign_layer_indices,
 )
 from .layers import InterpretorUnembedCrossAttention, LlamaDecoderLayerWithDoubleCrossAttention
+from ..das_utils import BoundlessRotatedSpaceIntervention, RotatedSpaceIntervention, LowRankRotatedSpaceIntervention
+
 from tqdm import tqdm
 from torch import optim
 import matplotlib.pyplot as plt
@@ -34,6 +36,7 @@ T = TypeVar("T", bound="LlamaInterpretor")
 
 
 class LlamaInterpretorConfig(LlamaConfig):
+    boundless_das: bool = False
     torch_dtype = torch.bfloat16
     chop_editor_at_layer: int = -1
     num_editing_heads: int = 32
@@ -69,6 +72,7 @@ class LlamaModelWithCrossAttention(LlamaModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
     ) -> Union[Tuple]:
+        
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -164,13 +168,27 @@ class LlamaModelWithCrossAttention(LlamaModel):
                     layer_outputs = decoder_layer(
                         hidden_states,
                         attention_mask=causal_mask,
+                        source_hidden_states=source_hidden_states,
+                        source_attention_mask=source_attention_mask,
+                        base_hidden_states=base_hidden_states,
+                        base_attention_mask=base_attention_mask,
                         position_ids=position_ids,
                         past_key_value=past_key_values,
                         output_attentions=output_attentions,
                         use_cache=use_cache,
                         cache_position=cache_position,
                     )
-
+                    """
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_values,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cache_position=cache_position,
+                    )
+                    """
             hidden_states = layer_outputs[0]
 
             if use_cache:
@@ -242,7 +260,6 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
             original_input_layernorm_weights = layer.input_layernorm.weight
             original_post_attention_layernorm = layer.post_attention_layernorm.weight
             
-            
             # with torch.no_grad():
             # Initialize the new layer with these parameters
             self.model.layers[i].self_attn.q_proj.weight = nn.Parameter(original_q_weights)
@@ -298,7 +315,6 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
         base_attention_mask: Optional[torch.FloatTensor] = None,
         source_hidden_states: Optional[torch.Tensor] = None,
         source_attention_mask: Optional[torch.FloatTensor] = None,
-        # labels: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
@@ -357,7 +373,7 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
 
 
 class LlamaInterpretor(nn.Module):
-    def __init__(self, config: LlamaInterpretorConfig):
+    def __init__(self, config: LlamaInterpretorConfig, das_intervention=False, das_dimension=None):
         super().__init__()
 
         self.config = config
@@ -365,7 +381,20 @@ class LlamaInterpretor(nn.Module):
         self.target_model = AutoModelForCausalLM.from_pretrained(
             config.name_or_path, torch_dtype = config.torch_dtype
         )
-
+        
+        self.use_das_intervention = das_intervention
+        
+        if self.use_das_intervention:
+            
+            if das_dimension is None:
+                self.das_module = BoundlessRotatedSpaceIntervention(
+                    embed_dim=self.target_model.config.hidden_size
+                )
+            else:
+                self.das_module = LowRankRotatedSpaceIntervention(
+                    embed_dim=self.target_model.config.hidden_size, low_rank_dimension=das_dimension
+                )
+            
         # freeze target model
         for param in self.target_model.parameters():
             param.requires_grad = False
@@ -428,13 +457,16 @@ class LlamaInterpretor(nn.Module):
         editor_attention_mask: torch.Tensor = None,
         base_input_ids: torch.Tensor = None,
         base_attention_mask: torch.Tensor = None,
+        base_intervention_mask: torch.Tensor = None,
         source_input_ids: torch.Tensor = None,
         source_attention_mask: torch.Tensor = None,
+        source_intervention_mask: torch.Tensor = None,
         base_hidden_states: torch.Tensor = None,
         base_position_ids: torch.Tensor = None,
         source_hidden_states: torch.Tensor = None,
         source_position_ids: torch.Tensor = None,
         intervention_layer: int = None,
+        output_vanilla_hidden_states: bool = True,
         output_edited_hidden_states: bool = False,
         output_intervention_weight: bool = True,
         intervention_weight: torch.Tensor = None,
@@ -445,7 +477,14 @@ class LlamaInterpretor(nn.Module):
         
                 
         if intervention_layer is None:
-            intervention_layer = self.config.intervention_layer        
+            intervention_layer = self.config.intervention_layer     
+            
+        if base_position_ids is None:
+            # 0 for all the padding tokens and start from 1 for the rest
+            base_position_ids = torch.cumsum(base_attention_mask, dim=1) * base_attention_mask
+        
+        if source_position_ids is None:
+            source_position_ids = torch.cumsum(source_attention_mask, dim=1) * source_attention_mask
         
         # Run target model for encoded hidden states
         if base_hidden_states is None:
@@ -464,6 +503,19 @@ class LlamaInterpretor(nn.Module):
                 dim=2,
             )
             
+        if base_intervention_mask is None:
+            if base_attention_mask is not None:
+                base_intervention_mask = base_attention_mask.clone()
+            else:
+                base_intervention_mask = torch.ones_like(base_input_ids)
+                
+        if source_intervention_mask is None:
+            if source_attention_mask is not None:
+                source_intervention_mask = source_attention_mask.clone()
+            else:
+                source_intervention_mask = torch.ones_like(source_input_ids)
+                
+            
         # dimensions of target_hidden_states:
         # batch_size, token_sequence_length, num_layers = 13, resid_width = 768
         # Normalize along the last dimension
@@ -476,15 +528,18 @@ class LlamaInterpretor(nn.Module):
         if intervention_weight is None:
             
             n_layer = base_hidden_states.shape[2]
-            
-            # collapsed_base_hidden_states (batch_size, token_sequence_length * num_layers, resid_width)
+                        
             collapsed_base_hidden_states = base_hidden_states.reshape(
                 base_hidden_states.shape[0],
                 base_hidden_states.shape[1] * base_hidden_states.shape[2],
                 base_hidden_states.shape[3],
             )
-            # collapsed_base_attention_mask (batch_size, token_sequence_length * num_layers)
-            collapsed_base_attention_mask = base_attention_mask.repeat(1, n_layer)
+            
+            collapsed_base_attention_mask = base_intervention_mask.unsqueeze(-1).repeat(1, 1, n_layer)
+            collapsed_base_attention_mask = collapsed_base_attention_mask.reshape(
+                base_intervention_mask.shape[0],
+                base_intervention_mask.shape[1] * n_layer,
+            )
             
             collapsed_source_hidden_states = source_hidden_states.reshape(
                 source_hidden_states.shape[0],
@@ -492,7 +547,11 @@ class LlamaInterpretor(nn.Module):
                 source_hidden_states.shape[3],
             )
             
-            collapsed_source_attention_mask = source_attention_mask.repeat(1, n_layer)
+            collapsed_source_attention_mask = source_intervention_mask.unsqueeze(-1).repeat(1, 1, n_layer)
+            collapsed_source_attention_mask = collapsed_source_attention_mask.reshape(
+                source_intervention_mask.shape[0],
+                source_intervention_mask.shape[1] * n_layer,
+            )
 
             interpretor_output = self.hypernetwork(
                 input_ids=editor_input_ids,
@@ -501,13 +560,13 @@ class LlamaInterpretor(nn.Module):
                 base_attention_mask=collapsed_base_attention_mask,
                 source_hidden_states=collapsed_source_hidden_states,
                 source_attention_mask=collapsed_source_attention_mask,
+                use_cache=False
             )
 
             # Multiply the outputs by normalization factors
             _, intervention_weight, _ = interpretor_output
             intervention_weight = intervention_weight.squeeze()
             
-        
         if inference_mode == "global_argmax":
             batch_size, _, num_base_pos = intervention_weight.shape
             source_base_intervention_flatten = intervention_weight[:, :-1, :].view(batch_size, -1)
@@ -538,11 +597,21 @@ class LlamaInterpretor(nn.Module):
         # This adds the edit vectors to the given hidden state at the specified batch index, position, and layer
         def representation_swap(module, input, output):
             base_hidden_states = output[0].clone()
+            batch_size = base_hidden_states.shape[0]
             base_intervention_weight = intervention_weight[:, -1, :]
-            res_diff = torch.einsum("bid,bi->bid", base_hidden_states, (1 - base_intervention_weight))
-            output[0][:] += (intervention_matrix - res_diff)
+            
+            if self.use_das_intervention:
+                source_intervention_hidden_states = intervention_matrix + torch.einsum("bid,bi->bid", base_hidden_states, - base_intervention_weight)
+                mixed_output = self.das_module(base_hidden_states, source_intervention_hidden_states, batch_size)
+                output[0][:] += (mixed_output - base_hidden_states)
+            else:
+                res_diff = torch.einsum("bid,bi->bid", base_hidden_states, (1 - base_intervention_weight))
+                output[0][:] += (intervention_matrix - res_diff)
             
         def embedding_representation_swap(module, input, output):
+            if self.use_das_intervention:
+                raise NotImplementedError("DAS intervention is not supported for token embeddings")
+            
             base_hidden_states = output.clone()
             base_intervention_weight = intervention_weight[:, -1, :]
             res_diff = torch.einsum("bid,bi->bid", base_hidden_states, (1 - base_intervention_weight))
@@ -572,6 +641,10 @@ class LlamaInterpretor(nn.Module):
             
         if output_intervention_weight:
             output.intervention_weight = intervention_weight
+            
+        if output_vanilla_hidden_states:
+            output.vanilla_base_hidden_states = base_hidden_states
+            output.vanilla_source_hidden_states = source_hidden_states
 
         return output
     

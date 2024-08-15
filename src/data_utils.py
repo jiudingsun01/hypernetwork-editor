@@ -17,6 +17,289 @@ SANITY_CHECK_TEMPLATES = {
 }
 
 
+def generate_ravel_prefix_suffix_dataset(
+    tokenizer, 
+    n_samples,
+    root_path = "./data/ravel/ravel_prefix_suffix",
+    split="train", 
+    domains=["city"], 
+    domains_excluded_attributes=[["Latitude", "Longitude", "Timezone"]],
+    seed=42,
+    filter_one_token_entities=False,
+    disentangling=False,
+    target_attributes=None
+):
+    random.seed(seed)
+    np.random.seed(seed)
+    dataset = []
+    
+    sample_per_domain = n_samples // len(domains)
+    
+    for i, (domain, excluded_attributes) in enumerate(zip(domains, domains_excluded_attributes)):
+        templates = json.load(open(os.path.join(root_path, f"ravel_{domain}_attribute_to_prompts.json"), "r"))
+        templates_split = json.load(open(os.path.join(root_path, f"ravel_{domain}_prompt_to_split.json"), "r"))
+
+        entities = json.load(open(os.path.join(root_path, f"ravel_{domain}_entity_attributes.json"), "r"))
+        entities_split = json.load(open(os.path.join(root_path, f"ravel_{domain}_entity_to_split.json"), "r"))
+        
+        all_attributes = [a for a in list(templates.keys()) if a not in excluded_attributes]
+
+        entities_train = {k: v for k, v in entities.items() if entities_split[k] == "train"}        
+        name_train = list(entities_train.keys())
+        templates_train = {k: [v for v in vs if vs.index(v) in templates_split["train"]] for k, vs in templates.items()}
+        entities_test = {k: v for k, v in entities.items() if entities_split[k] != "train"}
+        name_test = list(entities_test.keys())
+        templates_test = {k: [v for v in vs if vs.index(v) in templates_split["test"]] for k, vs in templates.items()}
+        
+        if split == "train":
+            entity_dict, entity_name, template_dict = entities_train, name_train, templates_train
+        elif split == "test":
+            entity_dict, entity_name, template_dict = entities_test, name_test, templates_test
+        else:
+            raise ValueError("split must be 'train' or 'test'")
+
+        template_num = [len(v) for k, v in template_dict.items()]
+        assert len(set(template_num)) == 1, "Different number of templates for different attributes"
+        template_num = template_num[0]
+        
+        if filter_one_token_entities:
+            
+            filtered_entities = []
+            
+            for entity in entity_dict.keys():
+                
+                entity_token_len = len(tokenizer(entity)["input_ids"])
+                if entity_token_len > 1:
+                    filtered_entities.append(entity)
+            
+            print(f"Filtered out {len(filtered_entities)} entities")
+            entity_dict = {k: v for k, v in entity_dict.items() if k not in filtered_entities}
+            entity_name = list(entity_dict.keys())
+        
+        
+        for _ in tqdm(range(sample_per_domain)):
+            
+            data = {}
+            
+            source_entity, base_entity = random.sample(entity_name, 2)
+            attribute = random.choice(all_attributes) if target_attributes is None else random.choice(target_attributes[i])
+            another_attribute = random.choice(all_attributes)
+            source_entity_dict, base_entity_dict = entity_dict[source_entity], entity_dict[base_entity]
+            source_template_idx, base_template_idx = random.choice(range(template_num)), random.choice(range(template_num))
+            source_template, base_template = template_dict[another_attribute][source_template_idx], template_dict[attribute][base_template_idx]
+            
+            source_template_prefix, source_template_suffix = source_template
+            base_template_prefix, base_template_suffix = base_template
+            
+            data["input_prefix"] = base_template_prefix % base_entity
+            data["input_suffix"] = base_template_suffix
+            data["entity"] = base_entity
+            data["counterfactual_input_prefix"] = source_template_prefix % source_entity
+            data["counterfactual_input_suffix"] = source_template_suffix
+            data["counterfactual_entity"] = source_entity
+            data["edit_instruction"] = f"{base_entity} ; {source_entity} - {attribute}"
+            data["target"] = base_entity_dict[attribute]
+            data["counterfactual_target"] = source_entity_dict[attribute]
+            
+            data["input_prefix_with_counterfactual_entity"] = base_template_prefix % source_entity
+            
+            if disentangling:
+                disentangled_attributes = [a for a in all_attributes if a != attribute]
+                data["disentangled_data"] = {
+                    "attributes": disentangled_attributes,
+                    "editor_instruction": [],
+                    "input_prefix": [],
+                    "input_suffix": [],
+                    "counterfactual_input_prefix": [],
+                    "counterfactual_input_suffix": [],
+                    "target": [],
+                    "counterfactual_target": [],
+                    "input_prefix_with_counterfactual_entity": []
+                }
+                for a in disentangled_attributes:
+                    disentangled_attribute_base_template = template_dict[a][base_template_idx]
+                    disentangled_template_prefix, disentangled_template_suffix = disentangled_attribute_base_template
+                    
+                    data["disentangled_data"]["editor_instruction"].append(f"{base_entity} ; {source_entity} - {attribute}")
+                    data["disentangled_data"]["input_prefix"].append(disentangled_template_prefix % base_entity)
+                    data["disentangled_data"]["input_suffix"].append(disentangled_template_suffix)
+                    data["disentangled_data"]["counterfactual_input_prefix"].append(source_template_prefix % source_entity)
+                    data["disentangled_data"]["counterfactual_input_suffix"].append(source_template_suffix)
+                    data["disentangled_data"]["target"].append(base_entity_dict[a])
+                    data["disentangled_data"]["counterfactual_target"].append(source_entity_dict[a])
+                    data["disentangled_data"]["input_prefix_with_counterfactual_entity"].append(disentangled_template_prefix % source_entity)
+            else:
+                data["disentangled_data"] = None
+                
+            dataset.append(data)
+                
+    dataset = Dataset.from_list(dataset)
+    return dataset
+
+
+def get_ravel_prefix_suffix_collate_fn(
+    tokenizer, 
+    disentangling=False, 
+    contain_entity_position=False, 
+    examine_source_output=False,
+    source_suffix_visibility=False,
+    base_suffix_visibility=False
+):
+    
+    def tokenize_text_inputs(prefixes, suffixes, counterfactual_prefixes, counterfactual_suffixes, target_texts, entities=None, counterfactual_entities=None):
+        
+        input_texts = [prefix + suffix + " " + target for prefix, suffix, target in zip(prefixes, suffixes, target_texts)]
+        counterfactual_texts = [prefix + suffix for prefix, suffix in zip(counterfactual_prefixes, counterfactual_suffixes)]
+        
+        source_intervention_visibility_masks, base_intervention_visibility_masks = [], []
+        
+        if entities is not None and counterfactual_entities is not None:
+            source_entity_position_ids = []
+            base_entity_position_ids = []
+        
+        tokenized = tokenizer(input_texts, return_tensors="pt", padding=True, max_length=50, truncation=True)
+        tokenized_counterfactual = tokenizer(counterfactual_texts, return_tensors="pt", padding=True, max_length=50, truncation=True)
+        tokenized_labels = []
+        
+        for i, input_ids in enumerate(tokenized["input_ids"]):
+            input_prompt = prefixes[i] + suffixes[i]
+            prompt_length = tokenizer(input_prompt, return_tensors="pt", padding=False)["input_ids"].shape[-1]
+            if tokenizer.padding_side == "left":
+                prompt_length += torch.sum(input_ids == tokenizer.pad_token_id)
+            
+            label = torch.full_like(input_ids, -100)
+            label[prompt_length:] = input_ids[prompt_length:]
+            label[input_ids == tokenizer.pad_token_id] = -100
+            tokenized_labels.append(label)
+            
+            if entities is not None and counterfactual_entities is not None:
+                entity_token = entities[i]
+                counterfactual_entity_token = counterfactual_entities[i]
+                
+                base_entity_position_ids.append([tokenizer.decode(ids).strip() for ids in input_ids].index(entity_token))
+                source_entity_position_ids.append([tokenizer.decode(ids).strip() for ids in tokenized_counterfactual["input_ids"][i]].index(counterfactual_entity_token))
+            
+            source_visibility_mask = tokenized_counterfactual["attention_mask"][i].clone()
+            
+            base_visibility_mask = tokenized["attention_mask"][i].clone()
+            label_length = torch.sum(label != -100)
+            base_visibility_mask[-label_length:] = 0
+            
+            if not source_suffix_visibility:
+                source_suffix_length = tokenizer(counterfactual_suffixes[i], return_tensors="pt", padding=False)["input_ids"].shape[-1]
+                source_visibility_mask[-source_suffix_length:] = 0
+                
+            if not base_suffix_visibility:
+                base_suffix_length = tokenizer(suffixes[i], return_tensors="pt", padding=False)["input_ids"].shape[-1]
+                base_visibility_mask[prompt_length - base_suffix_length:] = 0
+                
+            source_intervention_visibility_masks.append(source_visibility_mask)
+            base_intervention_visibility_masks.append(base_visibility_mask)
+                
+        base_intervention_mask = torch.stack(base_intervention_visibility_masks)
+        source_intervention_mask = torch.stack(source_intervention_visibility_masks)
+        tokenized_labels = torch.stack(tokenized_labels)
+        
+        return_dict = {
+            "base_input_ids": tokenized["input_ids"],
+            "base_attention_mask": tokenized["attention_mask"],
+            "base_intervention_mask": base_intervention_mask,
+            "source_input_ids": tokenized_counterfactual["input_ids"],
+            "source_attention_mask": tokenized_counterfactual["attention_mask"],
+            "source_intervention_mask": source_intervention_mask,
+            "labels": tokenized_labels
+        }
+        
+        if entities is not None and counterfactual_entities is not None:
+            return_dict["source_entity_position_ids"] = torch.tensor(source_entity_position_ids)
+            return_dict["base_entity_position_ids"] = torch.tensor(base_entity_position_ids)
+        
+        return return_dict
+    
+    def collate_fn(batch):
+        
+        prefixes, suffixes, edit_instructions, targets, counterfactual_prefixes, counterfactual_suffixes = [], [], [], [], [], []
+        if contain_entity_position:
+            assert "entity" in batch[0].keys() and "counterfactual_entity" in batch[0].keys()
+            entities, counterfactual_entities = [], []
+        else:
+            entities, counterfactual_entities = None, None
+            
+        for b in batch:
+            
+            if not examine_source_output:
+                prefixes.append(b["input_prefix"])
+                suffixes.append(b["input_suffix"])
+            else:
+                prefixes.append(b["input_prefix_with_counterfactual_entity"])
+                suffixes.append(b["input_suffix"])
+                
+            edit_instructions.append(b["edit_instruction"])
+            counterfactual_prefixes.append(b["counterfactual_input_prefix"])
+            counterfactual_suffixes.append(b["counterfactual_input_suffix"])
+            targets.append(b["counterfactual_target"])
+            
+            if contain_entity_position:
+                entities.append(b["entity"])
+                counterfactual_entities.append(b["counterfactual_entity"])
+            
+        editor_input_ids = tokenizer(edit_instructions, return_tensors="pt", padding=True, truncation=True)["input_ids"]
+        
+        returned_dict = {
+            "editor_input_ids": editor_input_ids,
+            **tokenize_text_inputs(prefixes, suffixes, counterfactual_prefixes, counterfactual_suffixes, targets, entities=entities, counterfactual_entities=counterfactual_entities),
+        }
+        
+        if disentangling:
+            assert batch[0]["disentangled_data"] is not None
+            
+            disentangled_prefix, disentangled_suffix, disentangled_counterfactual_prefix, disentangled_counterfactual_suffix, disentangled_target, disentangled_example_idxs = [], [], [], [], [], []
+            disentangled_editor_instructions = []
+            
+            for i, b in enumerate(batch):
+                
+                disentangled_prefix.extend(b["disentangled_data"]["input_prefix"])
+                disentangled_suffix.extend(b["disentangled_data"]["input_suffix"])
+                disentangled_counterfactual_prefix.extend(b["disentangled_data"]["counterfactual_input_prefix"])
+                disentangled_counterfactual_suffix.extend(b["disentangled_data"]["counterfactual_input_suffix"])
+                
+                disentangled_target.extend(b["disentangled_data"]["target"])
+                disentangled_example_idxs.extend([i] * len(b["disentangled_data"]["input_prefix"]))
+                disentangled_editor_instructions.extend(b["disentangled_data"]["editor_instruction"])
+                
+            disentangled_editor_input_ids = tokenizer(disentangled_editor_instructions, return_tensors="pt", padding=True, truncation=True)["input_ids"]
+            
+            disentangled_dict = tokenize_text_inputs(
+                disentangled_prefix, 
+                disentangled_suffix,
+                disentangled_counterfactual_prefix,
+                disentangled_counterfactual_suffix,
+                disentangled_target
+            )
+            
+            disentangled_example_idxs = torch.tensor(disentangled_example_idxs)
+            
+            returned_dict["disentangled_base_input_ids"] = disentangled_dict["base_input_ids"]
+            returned_dict["disentangled_base_attention_mask"] = disentangled_dict["base_attention_mask"]
+            returned_dict["disentangled_base_intervention_mask"] = disentangled_dict["base_intervention_mask"]
+            returned_dict["disentangled_source_input_ids"] = disentangled_dict["source_input_ids"]
+            returned_dict["disentangled_source_attention_mask"] = disentangled_dict["source_attention_mask"]
+            returned_dict["disentangled_source_intervention_mask"] = disentangled_dict["source_intervention_mask"]
+            returned_dict["disentangled_labels"] = disentangled_dict["labels"]
+            returned_dict["disentangled_editor_input_ids"] = disentangled_editor_input_ids
+            returned_dict["disentangled_example_idxs"] = disentangled_example_idxs            
+        
+        return returned_dict
+    
+    return collate_fn
+
+
+        
+        
+        
+        
+
+
 def generate_ravel_dataset(
     tokenizer, 
     n_samples,
@@ -27,9 +310,9 @@ def generate_ravel_dataset(
     all_templates=None,
     seed=42,
     filter_one_token_entities=False,
-    disentangling=False
-):
-            
+    disentangling=False,
+    target_attributes=None
+):       
     # Seed
     random.seed(seed)
     np.random.seed(seed)
@@ -37,7 +320,7 @@ def generate_ravel_dataset(
     
     sample_per_domain = n_samples // len(domains)
     
-    for domain, excluded_attributes in zip(domains, domains_excluded_attributes):
+    for i, (domain, excluded_attributes) in enumerate(zip(domains, domains_excluded_attributes)):
         
         if all_templates is None:
             templates = json.load(open(os.path.join(root_path, f"ravel_{domain}_attribute_to_prompts.json"), "r"))
@@ -86,7 +369,7 @@ def generate_ravel_dataset(
             data = {}
             
             source_entity, base_entity = random.sample(entity_name, 2)
-            attribute = random.choice(all_attributes)
+            attribute = random.choice(all_attributes) if target_attributes is None else random.choice(target_attributes[i])
             another_attribute = random.choice(all_attributes)
             source_entity_dict, base_entity_dict = entity_dict[source_entity], entity_dict[base_entity]
             source_template, base_template = random.choice(template_dict[another_attribute]), random.choice(template_dict[attribute])
@@ -246,13 +529,17 @@ def get_ravel_collate_fn(tokenizer, disentangling=False, contain_entity_position
     return collate_fn
 
 
-def filter_dataset(model, tokenizer, dataset, disentangling=False, batch_size=16):
+def filter_dataset(model, tokenizer, dataset, disentangling=False, batch_size=16, prefix_and_suffix=False):
         
     model.eval()
     
     correct_idxs = set()
     
+    
     collate_fn = get_ravel_collate_fn(
+        tokenizer, disentangling=disentangling, 
+        contain_entity_position=False, examine_source_output=True
+    ) if not prefix_and_suffix else get_ravel_prefix_suffix_collate_fn(
         tokenizer, disentangling=disentangling, 
         contain_entity_position=False, examine_source_output=True
     )
