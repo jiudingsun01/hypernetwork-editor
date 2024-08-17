@@ -391,6 +391,12 @@ class LlamaInterpretor(nn.Module):
                     embed_dim=self.target_model.config.hidden_size
                 )
             else:
+                """
+                self.das_module = RotatedSpaceIntervention(
+                    embed_dim=self.target_model.config.hidden_size, intervention_dim=das_dimension
+                )
+                """
+                
                 self.das_module = LowRankRotatedSpaceIntervention(
                     embed_dim=self.target_model.config.hidden_size, low_rank_dimension=das_dimension
                 )

@@ -179,7 +179,7 @@ class LowRankRotatedSpaceIntervention(TrainableIntervention, DistributedRepresen
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        rotate_layer = LowRankRotateLayer(self.embed_dim, kwargs["low_rank_dimension"])
+        rotate_layer = LowRankRotateLayer(self.embed_dim, kwargs["low_rank_dimension"], init_orth=False)
         self.rotate_layer = torch.nn.utils.parametrizations.orthogonal(rotate_layer)
         self.sparsity = kwargs["low_rank_dimension"] / self.embed_dim
         
@@ -203,7 +203,7 @@ class LowRankRotatedSpaceIntervention(TrainableIntervention, DistributedRepresen
         rotated_source = self.rotate_layer(source)
         
         output = base + torch.matmul(
-            (rotated_source - rotated_base), self.rotate_layer.weight.original.T
+            (rotated_source - rotated_base), self.rotate_layer.weight.T
         )
         
         return output.to(base.dtype)

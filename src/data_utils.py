@@ -143,12 +143,17 @@ def get_ravel_prefix_suffix_collate_fn(
     contain_entity_position=False, 
     examine_source_output=False,
     source_suffix_visibility=False,
-    base_suffix_visibility=False
+    base_suffix_visibility=False,
+    add_space_before_target=True,
 ):
     
     def tokenize_text_inputs(prefixes, suffixes, counterfactual_prefixes, counterfactual_suffixes, target_texts, entities=None, counterfactual_entities=None):
         
-        input_texts = [prefix + suffix + " " + target for prefix, suffix, target in zip(prefixes, suffixes, target_texts)]
+        if add_space_before_target:
+            input_texts = [prefix + suffix + " " + target for prefix, suffix, target in zip(prefixes, suffixes, target_texts)]
+        else:
+            input_texts = [prefix + suffix + target for prefix, suffix, target in zip(prefixes, suffixes, target_texts)]
+            
         counterfactual_texts = [prefix + suffix for prefix, suffix in zip(counterfactual_prefixes, counterfactual_suffixes)]
         
         source_intervention_visibility_masks, base_intervention_visibility_masks = [], []
@@ -294,11 +299,171 @@ def get_ravel_prefix_suffix_collate_fn(
     return collate_fn
 
 
-        
-        
-        
-        
 
+def generate_ravel_dataset_from_filtered(
+    tokenizer, 
+    n_samples,
+    root_path = "./data/ravel/ravel_raw",
+    filtered_dataset_path = "./data/ravel/llama3-8b_city_train_10k_per_attr.json",
+    split="train", 
+    domains=["city"], 
+    isolate_attributes=[["Continent"]],
+    seed=42,
+    disentangling=True,
+    target_attributes=[["Country"]]
+):
+    # Seed
+    random.seed(seed)
+    np.random.seed(seed)
+    dataset = []
+    
+    sample_per_domain = n_samples if not disentangling else n_samples // (len(target_attributes[0]) + len(isolate_attributes[0]))
+
+    for i, domain in enumerate(domains):
+        templates = json.load(open(os.path.join(root_path, f"ravel_{domain}_attribute_to_prompts.json"), "r"))
+        templates_split = json.load(open(os.path.join(root_path, f"ravel_{domain}_prompt_to_split.json"), "r"))
+        entities_split = json.load(open(os.path.join(root_path, f"ravel_{domain}_entity_to_split.json"), "r"))
+        entities = json.load(open(os.path.join(root_path, f"ravel_{domain}_entity_attributes.json"), "r"))
+        
+        entities_train = {k: v for k, v in entities.items() if entities_split[k] == "train"}        
+        name_train = list(entities_train.keys())
+        templates_train = {k: [v for v in vs if templates_split[v] == "train"] for k, vs in templates.items()}
+
+        entities_test = {k: v for k, v in entities.items() if entities_split[k] != "train"}
+        name_test = list(entities_test.keys())
+        templates_test = {k: [v for v in vs if templates_split[v] != "train"] for k, vs in templates.items()}
+        
+        if split == "train":
+            entity_dict, entity_name, template_dict = entities_train, name_train, templates_train
+        elif split == "test":
+            entity_dict, entity_name, template_dict = entities_test, name_test, templates_test
+        else:
+            raise ValueError("split must be 'train' or 'test'")
+        
+        
+        for j, target_attribute in enumerate(target_attributes[i]):
+            
+            filtered_dict_key = f"{target_attribute}-train"
+            filtered_dict = json.load(open(filtered_dataset_path, "r"))[filtered_dict_key]
+            
+            # Adding Split Information
+            for n in range(len(filtered_dict)):
+                entity = filtered_dict[n]["entity"]
+                filtered_dict[n]["train_test_split"] = "train" if entity in name_train else "test"
+                
+            filtered_dict_train = [d for d in filtered_dict if d["train_test_split"] == "train"]
+            filtered_dict_test = [d for d in filtered_dict if d["train_test_split"] == "test"]
+            filtered_dict = filtered_dict_train if split == "train" else filtered_dict_test
+            
+            sample_idxs = np.random.choice(len(filtered_dict), sample_per_domain, replace=False)
+            
+            for idx in tqdm(sample_idxs):
+                
+                data = {}
+                data_sample = filtered_dict[idx]
+                
+                input_text = data_sample["input"]
+                source_text = data_sample["source_input"]
+                
+                entity = data_sample["entity"]
+                source_entity = data_sample["source_entity"]
+                
+                splits = input_text.split(entity)
+                
+                if len(splits) == 2:
+                    data["input_prefix"], data["input_suffix"] = splits
+                elif len(splits) > 2:
+                    data["input_suffix"] = splits[-1]
+                    data["input_prefix"] = entity.join(splits[:-1])
+                else:
+                    raise ValueError("Input Text does not contain entity")
+                
+                data["input_prefix"] += entity
+                data["entity"] = entity
+                
+                source_splits = source_text.split(source_entity)
+                
+                if len(source_splits) == 2:
+                    data["counterfactual_input_prefix"], data["counterfactual_input_suffix"] = source_splits
+                elif len(source_splits) > 2:
+                    data["counterfactual_input_suffix"] = source_splits[-1]
+                    data["counterfactual_input_prefix"] = source_entity.join(source_splits[:-1])
+                else:
+                    raise ValueError("Source Text does not contain source entity")
+                data["counterfactual_input_prefix"] += source_entity
+                data["counterfactual_entity"] = source_entity
+                
+                data["edit_instruction"] = f"{entity} ; {source_entity} - {random.choice(target_attributes[i])}"
+                
+                base_entity_dict = entity_dict[entity]
+                source_entity_dict = entity_dict[source_entity]
+                
+                data["target"] = base_entity_dict[target_attribute]
+                data["counterfactual_target"] = source_entity_dict[target_attribute]   
+                dataset.append(data)           
+        
+        for j, isolate_attribute in enumerate(isolate_attributes[i]):
+            
+            filtered_dict_key = f"{isolate_attribute}-train"
+            filtered_dict = json.load(open(filtered_dataset_path, "r"))[filtered_dict_key]
+            
+            # Adding Split Information
+            for n in range(len(filtered_dict)):
+                entity = filtered_dict[n]["entity"]
+                filtered_dict[n]["train_test_split"] = "train" if entity in name_train else "test"
+                
+            filtered_dict_train = [d for d in filtered_dict if d["train_test_split"] == "train"]
+            filtered_dict_test = [d for d in filtered_dict if d["train_test_split"] == "test"]
+            filtered_dict = filtered_dict_train if split == "train" else filtered_dict_test
+            
+            for _ in tqdm(range(sample_per_domain)):
+                
+                data = {}
+                data_sample = filtered_dict[idx]
+                
+                input_text = data_sample["input"]
+                source_text = data_sample["source_input"]
+                
+                entity = data_sample["entity"]
+                source_entity = data_sample["source_entity"]
+                
+                splits = input_text.split(entity)
+                
+                if len(splits) == 2:
+                    data["input_prefix"], data["input_suffix"] = splits
+                elif len(splits) > 2:
+                    data["input_suffix"] = splits[-1]
+                    data["input_prefix"] = entity.join(splits[:-1])
+                else:
+                    raise ValueError("Input Text does not contain entity")
+                
+                data["input_prefix"] += entity
+                data["entity"] = entity
+                
+                source_splits = source_text.split(source_entity)
+                
+                if len(source_splits) == 2:
+                    data["counterfactual_input_prefix"], data["counterfactual_input_suffix"] = source_splits
+                elif len(source_splits) > 2:
+                    data["counterfactual_input_suffix"] = source_splits[-1]
+                    data["counterfactual_input_prefix"] = source_entity.join(source_splits[:-1])
+                else:
+                    raise ValueError("Source Text does not contain source entity")
+                data["counterfactual_input_prefix"] += source_entity
+                data["counterfactual_entity"] = source_entity
+                
+                data["edit_instruction"] = f"{entity} ; {source_entity} - {random.choice(target_attributes[i])}"
+                
+                base_entity_dict = entity_dict[entity]
+                source_entity_dict = entity_dict[source_entity]
+                
+                data["target"] = source_entity_dict[isolate_attribute] 
+                data["counterfactual_target"] = base_entity_dict[isolate_attribute]
+                dataset.append(data)
+                
+    dataset = Dataset.from_list(dataset)
+    return dataset
+        
 
 def generate_ravel_dataset(
     tokenizer, 

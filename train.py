@@ -13,7 +13,7 @@ import numpy as np
 import json
 from tqdm import tqdm
 from datasets import Dataset, load_from_disk
-from src.data_utils import get_ravel_prefix_suffix_collate_fn, generate_ravel_prefix_suffix_dataset
+from src.data_utils import get_ravel_prefix_suffix_collate_fn, generate_ravel_prefix_suffix_dataset, generate_ravel_dataset_from_filtered
 import argparse
 
 
@@ -59,13 +59,22 @@ def run_experiment(
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
-
+    """
     city_dataset = load_from_disk(dataset_path)
     train_set = city_dataset["train"]
     test_set = city_dataset["test"]
-
     collate_fn = get_ravel_prefix_suffix_collate_fn(tokenizer, disentangling=disentangling, source_suffix_visibility=source_suffix_visibility, base_suffix_visibility=base_suffix_visibility)
-
+    """
+    
+    city_dataset = generate_ravel_dataset_from_filtered(
+        tokenizer=tokenizer,
+        n_samples=20000,
+    )
+    city_dataset = city_dataset.shuffle()
+    train_set = city_dataset.select(range(19000))
+    test_set = city_dataset.select(range(19500, 20000))
+    collate_fn = get_ravel_prefix_suffix_collate_fn(tokenizer, disentangling=False, source_suffix_visibility=True, base_suffix_visibility=base_suffix_visibility, add_space_before_target=False)
+    
     data_loader = DataLoader(
         train_set, batch_size=batch_size, collate_fn=collate_fn, shuffle=True
     )  # batch_size, collate_fn=collate_fn)
@@ -95,9 +104,9 @@ def run_experiment(
         epochs=10,
         checkpoint_per_steps = 500,
         eval_per_steps = 75,
-        disentangling=disentangling,
+        disentangling=False,
         save_dir=save_dir,
-        weight_decay=0.01, 
+        weight_decay=0.00, 
         lr=3e-5
     )
 

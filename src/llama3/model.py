@@ -405,6 +405,8 @@ class RavelInterpretorHypernetwork(nn.Module):
         if save_dir is not None and not os.path.exists(save_dir):
             os.makedirs(save_dir)
             
+        # print(self.interpretor.das_module.rotate_layer.named_parameters())
+            
         trainable_parameters = []
         for name, param in self.named_parameters():
             if "target_model" not in name:
