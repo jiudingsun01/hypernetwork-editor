@@ -72,7 +72,7 @@ def run_experiment(
     )
     city_dataset = city_dataset.shuffle()
     train_set = city_dataset.select(range(19000))
-    test_set = city_dataset.select(range(19500, 20000))
+    test_set = city_dataset.select(range(19000, 20000))
     collate_fn = get_ravel_prefix_suffix_collate_fn(tokenizer, disentangling=False, source_suffix_visibility=True, base_suffix_visibility=base_suffix_visibility, add_space_before_target=False)
     
     data_loader = DataLoader(
@@ -121,7 +121,7 @@ if __name__ == "__main__":
     parser.add_argument("--no_das", default=False, action="store_false")
     parser.add_argument("--model_name_or_path", type=str, default="/work/frink/models/llama3-8B-HF")
     parser.add_argument("--dataset_path", type=str, default="./data/ravel/city_Country")
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--no_disentangling", default=False, action="store_false")
     parser.add_argument("--source_suffix_visibility", default=False, action="store_true")
     parser.add_argument("--base_suffix_visibility", default=False, action="store_true")
