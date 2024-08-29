@@ -382,6 +382,8 @@ class LlamaInterpretor(nn.Module):
             config.name_or_path, torch_dtype = config.torch_dtype
         )
         
+        self.bidding_threshold = 0.1
+        
         self.use_das_intervention = das_intervention
         
         if self.use_das_intervention:
@@ -479,7 +481,7 @@ class LlamaInterpretor(nn.Module):
         inference_mode: str = None,
     ) -> InterpretorModelOutput:
         
-        assert inference_mode in [None, "column_argmax", "global_argmax", "groundtruth"]
+        assert inference_mode in [None, "column_argmax", "global_argmax", "groundtruth", "bidding_argmax"]
         
                 
         if intervention_layer is None:
@@ -588,7 +590,22 @@ class LlamaInterpretor(nn.Module):
             batch_size, num_src_pos, num_base_pos = intervention_weight.shape
             intervention_weight = torch.argmax(intervention_weight, dim=1)
             intervention_weight = torch.nn.functional.one_hot(intervention_weight, num_classes=num_src_pos).float().permute(0, 2, 1)            
+        elif inference_mode == "bidding_argmax":
+            batch_size, num_src_pos, num_base_pos = intervention_weight.shape
+            bidding_weight = torch.argmax(intervention_weight[:, :-1, :], dim=-1)
+            bidding_weight = torch.nn.functional.one_hot(bidding_weight, num_classes=num_src_pos - 1).float()
+            bidding_weight = torch.cat([bidding_weight, torch.ones(batch_size, 1, num_base_pos).to(bidding_weight.device)], dim=1)
+            intervention_weight = torch.where(bidding_weight == 1, intervention_weight, torch.zeros_like(intervention_weight))
+            if self.bidding_threshold is not None:
+                threshold = torch.Tensor([self.bidding_threshold]).to(intervention_weight.device)
+                threshold = threshold.repeat(batch_size, num_base_pos)
+                intervention_weight[:, -1, :] = torch.where(intervention_weight[:, -1, :] > self.bidding_threshold, intervention_weight[:, -1, :], threshold)
+            intervention_weight = torch.argmax(intervention_weight, dim=1)
+            intervention_weight = torch.nn.functional.one_hot(intervention_weight, num_classes=num_src_pos).float().permute(0, 2, 1)
             
+        if len(intervention_weight.shape) == 2:
+            intervention_weight = intervention_weight.unsqueeze(0) # Unsqueeze first dim if batch size = 1
+                
         source_output = self.target_model(
             input_ids=source_input_ids,
             attention_mask=source_attention_mask,

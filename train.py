@@ -13,7 +13,7 @@ import numpy as np
 import json
 from tqdm import tqdm
 from datasets import Dataset, load_from_disk
-from src.data_utils import get_ravel_prefix_suffix_collate_fn, generate_ravel_prefix_suffix_dataset, generate_ravel_dataset_from_filtered
+from src.data_utils import get_ravel_collate_fn, generate_ravel_dataset_from_filtered
 import argparse
 
 
@@ -23,35 +23,55 @@ from transformers import AutoTokenizer
 def run_experiment(
     log_wandb=True,
     wandb_project="hypernetworks-interpretor",
+    wandb_run_name=None,
     intervention_layer=15,
     no_das=False,
     model_name_or_path="/work/frink/models/llama3-8B-HF",
-    dataset_path="./data/ravel/city_country_prefix_and_suffix_disentangling",
     batch_size=8,
-    no_disentangling=False,
-    source_suffix_visibility=False,
+    source_suffix_visibility=True,
     base_suffix_visibility=False,
     save_dir=None,
-    das_dimension=None
+    das_dimension=None,
+    n_epochs=1,
+    n_samples=20000,
+    train_test_split=0.95,
+    lr=3e-5,
+    weight_decay=0.01,
+    eval_per_steps=100,
+    checkpoint_per_steps=500,
+    domain="city",
+    filtered_dataset_path=None,
+    isolate_attributes=["Country"],
+    target_attributes=["Continent"],
+    test_path=None,
+    train_path=None,
 ):
+    
+    if filtered_dataset_path is None:
+        assert train_path is not None and test_path is not None
     if save_dir is not None:
         save_dir = os.path.join("./models", save_dir)
         
     use_das_intervention = not no_das
-    disentangling = not no_disentangling
         
     if log_wandb:
-        run_name = f"L{intervention_layer}"
-        if disentangling:
-            run_name += "-Disentangling"
-        if use_das_intervention:
-            run_name += "-DAS"
-            
         wandb.init(
             project=wandb_project,
-            name=run_name,
-            config={"targetmodel": "llama3-8b", "editormodel": "llama3-8b", "dataset": "ravel-city"},
-        )  
+            name=wandb_run_name,
+            config={
+                "targetmodel": model_name_or_path, 
+                "editormodel": model_name_or_path, 
+                "dataset": "ravel",
+                "intervention_layer": intervention_layer,
+                "das_intervention": use_das_intervention,
+                "source_suffix_visibility": source_suffix_visibility,
+                "base_suffix_visibility": base_suffix_visibility,
+                "das_dimension": das_dimension,
+                "domain": domain,
+                "isolate_attributes": isolate_attributes,
+                "target_attributes": target_attributes,
+            },
+        )
     
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
@@ -59,33 +79,39 @@ def run_experiment(
     tokenizer.padding_side = "left"
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.pad_token_id = tokenizer.eos_token_id
-    """
-    city_dataset = load_from_disk(dataset_path)
-    train_set = city_dataset["train"]
-    test_set = city_dataset["test"]
-    collate_fn = get_ravel_prefix_suffix_collate_fn(tokenizer, disentangling=disentangling, source_suffix_visibility=source_suffix_visibility, base_suffix_visibility=base_suffix_visibility)
-    """
     
-    city_dataset = generate_ravel_dataset_from_filtered(
-        tokenizer=tokenizer,
-        n_samples=20000,
+    if filtered_dataset_path is not None:
+        city_dataset = generate_ravel_dataset_from_filtered(
+            n_samples=n_samples,
+            domain=domain,
+            filtered_dataset_path=filtered_dataset_path,
+            isolate_attributes=isolate_attributes,
+            target_attributes=target_attributes
+        )
+        city_dataset = city_dataset.shuffle()
+        train_test_split = int(n_samples * train_test_split)
+        train_set = city_dataset.select(range(train_test_split))
+        test_set = city_dataset.select(range(train_test_split, n_samples))
+    else:
+        train_set = load_from_disk(train_path)
+        test_set = load_from_disk(test_path)
+                
+    collate_fn = get_ravel_collate_fn(
+        tokenizer, 
+        source_suffix_visibility=source_suffix_visibility, 
+        base_suffix_visibility=base_suffix_visibility, 
+        add_space_before_target=True
     )
-    city_dataset = city_dataset.shuffle()
-    train_set = city_dataset.select(range(19000))
-    test_set = city_dataset.select(range(19000, 20000))
-    collate_fn = get_ravel_prefix_suffix_collate_fn(tokenizer, disentangling=False, source_suffix_visibility=True, base_suffix_visibility=base_suffix_visibility, add_space_before_target=False)
     
     data_loader = DataLoader(
         train_set, batch_size=batch_size, collate_fn=collate_fn, shuffle=True
-    )  # batch_size, collate_fn=collate_fn)
+    )
+    
     test_data_loader = DataLoader(
         test_set, batch_size=batch_size, collate_fn=collate_fn, shuffle=True
     )
 
-    from src.llama3.modules import LlamaInterpretor, LlamaInterpretorConfig
-    from src.utils import EditorModelOutput
     from src.llama3.model import RavelInterpretorHypernetwork
-
 
     hypernetwork = RavelInterpretorHypernetwork(
         model_name_or_path=model_name_or_path,
@@ -101,34 +127,53 @@ def run_experiment(
     hypernetwork.run_train(
         train_loader=data_loader,
         test_loader=test_data_loader,
-        epochs=10,
-        checkpoint_per_steps = 500,
-        eval_per_steps = 75,
-        disentangling=False,
+        epochs=n_epochs,
+        checkpoint_per_steps = checkpoint_per_steps,
+        eval_per_steps = eval_per_steps,
         save_dir=save_dir,
-        weight_decay=0.00, 
-        lr=3e-5
+        weight_decay=weight_decay, 
+        lr=lr
     )
 
     if log_wandb:
         wandb.finish()
+        
+    if save_dir is not None:
+        train_set.save_to_disk(os.path.join(save_dir, "train"))
+        test_set.save_to_disk(os.path.join(save_dir, "test"))
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--log_wandb", type=bool, default=True)
     parser.add_argument("--wandb_project", type=str, default="hypernetworks-interpretor")
+    parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--intervention_layer", type=int, default=15)
-    parser.add_argument("--no_das", default=False, action="store_false")
+    parser.add_argument("--n_epochs", type=int, default=3)
+    parser.add_argument("--no_das", default=False, action="store_true")
     parser.add_argument("--model_name_or_path", type=str, default="/work/frink/models/llama3-8B-HF")
-    parser.add_argument("--dataset_path", type=str, default="./data/ravel/city_Country")
-    parser.add_argument("--batch_size", type=int, default=16)
-    parser.add_argument("--no_disentangling", default=False, action="store_false")
+    parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--source_suffix_visibility", default=False, action="store_true")
     parser.add_argument("--base_suffix_visibility", default=False, action="store_true")
     parser.add_argument("--save_dir", type=str, default=None)
+    parser.add_argument("--test_path", type=str, default= "./data/ravel/prompt_generalization_test")
+    parser.add_argument("--train_path", type=str, default= "./data/ravel/prompt_generalization_train")
+    
+    parser.add_argument("--filtered_dataset_path", type=str, default=None)
+    
+    # if filtered_dataset_path is not None:
+    parser.add_argument("--n_samples", type=int, default=20000)
+    parser.add_argument("--train_test_split", type=int, default=0.97)
+    parser.add_argument("--domain", type=str, default="city")
+    parser.add_argument('--isolate_attributes', nargs='+', default=["Continent"])
+    parser.add_argument('--target_attributes', nargs='+', default=["Country"])
     
     # if None, use Boundless DAS
-    parser.add_argument("--das_dimension", type=int, default=None)
+    parser.add_argument("--das_dimension", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--weight_decay", type=float, default=0.01)
+    parser.add_argument("--eval_per_steps", type=int, default=100)
+    parser.add_argument("--checkpoint_per_steps", type=int, default=500)
+    
     
     args = parser.parse_args()
     args = dict(args.__dict__)

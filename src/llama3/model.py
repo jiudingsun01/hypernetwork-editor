@@ -92,7 +92,7 @@ class RavelInterpretorHypernetwork(nn.Module):
             intervention_weight=intervention_weight,
             inference_mode=inference_mode
         )
-                
+        
         if labels is not None:
             log_prob_predictions = torch.nn.functional.log_softmax(
                 _pred.logits.reshape(-1, _pred.logits.shape[-1]),
@@ -108,6 +108,7 @@ class RavelInterpretorHypernetwork(nn.Module):
             output_idices[:-1] = label_indices[1:]
             
             log_prob_predictions = log_prob_predictions[output_idices, :]
+        
             labels = labels[label_indices]
             
             # Compute the cross-entropy loss with masking
@@ -121,8 +122,8 @@ class RavelInterpretorHypernetwork(nn.Module):
     # Generate text using the target model, with a new edit application at every step.
     # This is a very slow way to generate text.
     # If you only want to edit first k tokens, use the forward pass instead with stop_editing_index = k
-    def inspect_batch_prediction_ouptuts(self, batch, disentangling=False, inference_mode=None):
-        assert inference_mode in [None, "column_argmax", "global_argmax", "groundtruth"]
+    def inspect_batch_prediction_ouptuts(self, batch, inference_mode=None, eval_n_label_tokens=None):
+        assert inference_mode in [None, "column_argmax", "global_argmax", "groundtruth", "bidding_argmax"]
         self.interpretor.eval()
         
         correct_idxs = []
@@ -150,41 +151,7 @@ class RavelInterpretorHypernetwork(nn.Module):
                 labels=batch["labels"].to("cuda"),
                 output_intervention_weight=True,
                 inference_mode=inference_mode
-            )
-            
-            if disentangling:
-                disentangling_batch_output = []
-                
-                disentangling_prediction = self.forward(
-                    editor_input_ids=batch["disentangled_editor_input_ids"].to("cuda"),
-                    base_input_ids=batch["disentangled_base_input_ids"].to("cuda"),
-                    base_attention_mask=batch["disentangled_base_attention_mask"].to("cuda"),
-                    base_intervention_mask=batch["disentangled_base_intervention_mask"].to("cuda"),
-                    source_input_ids=batch["disentangled_source_input_ids"].to("cuda"),
-                    source_attention_mask=batch["disentangled_source_attention_mask"].to("cuda"),
-                    source_intervention_mask=batch["disentangled_source_intervention_mask"].to("cuda"),
-                    labels=batch["disentangled_labels"].to("cuda"),
-                    output_intervention_weight=True,
-                    inference_mode=inference_mode
-                )
-                
-                batch_disentangling_pred_ids = torch.argmax(disentangling_prediction["logits"], dim=-1)
-                batch_disentangling_full_output = self.tokenizer.batch_decode(batch_disentangling_pred_ids, skip_special_tokens=True)
-                correct_disentangling = []
-                    
-                for label, pred_ids in zip(batch["disentangled_labels"].to("cuda"), batch_disentangling_pred_ids):
-                    label_idx = label != -100
-                    output_idx = torch.zeros_like(label_idx)
-                    output_idx[:-1] = label_idx[1:]
-                    
-                    label = label[label_idx]
-                    pred_ids = pred_ids[output_idx]
-                    disentangling_batch_output.append(self.tokenizer.decode(pred_ids, skip_special_tokens=True))
-                    
-                    correct_disentangling.append((torch.sum(label == pred_ids) == torch.numel(label)))
-                
-                correct_disentangling = torch.stack(correct_disentangling)
-                
+            )    
             
             batch_pred_ids = torch.argmax(predictions["logits"], dim=-1)
             batch_full_output = self.tokenizer.batch_decode(batch_pred_ids, skip_special_tokens=True)
@@ -201,15 +168,15 @@ class RavelInterpretorHypernetwork(nn.Module):
                 label = label[label_idx]
                 pred_ids = pred_ids[output_idx]
                 
+                if eval_n_label_tokens is not None and len(label) > eval_n_label_tokens:
+                    label = label[:eval_n_label_tokens]
+                    pred_ids = pred_ids[:eval_n_label_tokens]
+                
                 batch_output.append(
                     self.tokenizer.decode(pred_ids, skip_special_tokens=True)
                 )
                 
                 is_correct = torch.sum(label == pred_ids) == torch.numel(label)
-                
-                if disentangling:
-                    instance_idx = torch.nonzero(batch["disentangled_example_idxs"].to("cuda") == i).squeeze()
-                    is_correct = is_correct and all(correct_disentangling[instance_idx])
                 
                 if is_correct:
                     correct_idxs.append(i)
@@ -221,18 +188,19 @@ class RavelInterpretorHypernetwork(nn.Module):
             "batch_intervention_weight": predictions.intervention_weight,
             "n_correct": correct,
             "correct_idxs": correct_idxs
-        }
-        
-        if disentangling:
-            return_dict["disentangling_output"] = disentangling_batch_output
-            return_dict["disentangling_full_output"] = batch_disentangling_full_output
-            return_dict["disentangling_example_ids"] = batch["disentangled_example_idxs"]
-            return_dict["disentangling_intervention_weight"] = disentangling_prediction.intervention_weight
-            
+        }   
         return return_dict
         
     
-    def plot_heatmap(self, data_loader, idxs, batch_size=4, disentangling=False, inference_mode=None, annot=True):
+    def plot_heatmap(
+        self, 
+        data_loader, 
+        idxs, 
+        batch_size=4, 
+        inference_mode=None, 
+        annot=True,
+        indicate_masked_tokens=False
+    ):
         batch_id = idxs // batch_size
         example_id = idxs % batch_size
 
@@ -240,7 +208,7 @@ class RavelInterpretorHypernetwork(nn.Module):
             if i == batch_id:
                 break
             
-        results = self.inspect_batch_prediction_ouptuts(batch, inference_mode=inference_mode, disentangling=disentangling)
+        results = self.inspect_batch_prediction_ouptuts(batch, inference_mode=inference_mode, eval_n_label_tokens=3)
 
         editor_input_ids = batch["editor_input_ids"][example_id]
         base_input_ids = batch["base_input_ids"][example_id]
@@ -256,56 +224,22 @@ class RavelInterpretorHypernetwork(nn.Module):
         label = label[label != -100]
         label = self.tokenizer.decode(label)
 
-        if not disentangling:
-            _, ax = plt.subplots(figsize=(10, 10))
-        else:
-            disentangling_num_cases = torch.sum(batch["disentangled_example_idxs"] == example_id).item()
-            _, ax = plt.subplots(1, 1 + disentangling_num_cases, figsize=(10 + disentangling_num_cases * 10, 8))
+        _, ax = plt.subplots(figsize=(10, 10))
+       
+        sns.heatmap(intervention_weight.float().cpu().numpy(), xticklabels=base_axis, yticklabels=source_axis, ax=ax, annot=annot)
+
+        ax.set_title(f"Instruction: {editor_text}     Label: {label}    Pred: {results['batch_output'][example_id]}")
+        ax.set_xlabel("Base Sentence Tokens")
+        ax.set_ylabel("Source Sentence Tokens")
         
-        if not disentangling:
-            sns.heatmap(intervention_weight.float().cpu().numpy(), xticklabels=base_axis, yticklabels=source_axis, ax=ax, annot=annot)
-
-            ax.set_title(f"Instruction: {editor_text}     Label: {label}    Pred: {results['batch_output'][example_id]}")
-            ax.set_xlabel("Base Sentence Tokens")
-            ax.set_ylabel("Source Sentence Tokens")
-        else:
-            sns.heatmap(intervention_weight.float().cpu().numpy(), xticklabels=base_axis, yticklabels=source_axis, ax=ax[0], annot=annot)
-
-            ax[0].set_title(f"Instruction: {editor_text}     Label: {label}    Pred: {results['batch_output'][example_id]}")
-            ax[0].set_xlabel("Base Sentence Tokens")
-            ax[0].set_ylabel("Source Sentence Tokens")
-            
-            indices = (batch["disentangled_example_idxs"] == example_id).nonzero(as_tuple=True)[0]
-            
-            for i, idx in enumerate(indices):
-                ax_id = i + 1
-                base_input_ids = batch["disentangled_base_input_ids"][idx]
-                source_input_ids = batch["disentangled_source_input_ids"][idx]
-                intervention_weight = results["disentangling_intervention_weight"][idx]
-                label = batch["disentangled_labels"][idx]
-                
-                assert intervention_weight.size() == (len(source_input_ids) + 1, len(base_input_ids))
-
-                source_axis = [self.tokenizer.decode([i]) for i in source_input_ids] + ["[SELF]"]
-                base_axis = [self.tokenizer.decode([i]) for i in base_input_ids]
-                editor_text = self.tokenizer.decode(editor_input_ids)
-                label = label[label != -100]
-                label = self.tokenizer.decode(label)
-                
-                sns.heatmap(intervention_weight.float().cpu().numpy(), xticklabels=base_axis, yticklabels=source_axis, ax=ax[ax_id], annot=annot)
-
-                ax[ax_id].set_title(f"Instruction: {editor_text}     Label: {label}    Pred: {results['disentangling_output'][example_id]}")
-                ax[ax_id].set_xlabel("Base Sentence Tokens")
-                ax[ax_id].set_ylabel("Source Sentence Tokens")
         
-    def eval_accuracy(self, test_loader, disentangling=False, inference_mode=None):
-        assert inference_mode in [None, "column_argmax", "global_argmax", "groundtruth"]
+    def eval_accuracy(self, test_loader, inference_mode=None, eval_n_label_tokens=None):
+        assert inference_mode in [None, "column_argmax", "global_argmax", "groundtruth", "bidding_argmax"]
         
         self.interpretor.eval()
         test_loss = []
         correct_idxs = []
-        correct = 0
-        total = 0
+        is_causal = []
         
         with torch.no_grad():
             for batch_id, batch in enumerate(test_loader):
@@ -319,7 +253,7 @@ class RavelInterpretorHypernetwork(nn.Module):
                         intervention_weight[i, batch["source_entity_position_ids"][i], batch["base_entity_position_ids"][i]] = 1.0
                 else:
                     intervention_weight=None
-                    
+                                        
                 predictions = self.forward(
                     editor_input_ids=batch["editor_input_ids"].to("cuda"),
                     base_input_ids=batch["base_input_ids"].to("cuda"),
@@ -335,35 +269,7 @@ class RavelInterpretorHypernetwork(nn.Module):
                 test_loss.append(predictions["loss"].item())
                 
                 batch_pred_ids = torch.argmax(predictions["logits"], dim=-1)
-                
-                if disentangling:
-                    disentangling_prediction = self.forward(
-                        editor_input_ids=batch["disentangled_editor_input_ids"].to("cuda"),
-                        base_input_ids=batch["disentangled_base_input_ids"].to("cuda"),
-                        base_attention_mask=batch["disentangled_base_attention_mask"].to("cuda"),
-                        base_intervention_mask=batch["disentangled_base_intervention_mask"].to("cuda"),
-                        source_input_ids=batch["disentangled_source_input_ids"].to("cuda"),
-                        source_attention_mask=batch["disentangled_source_attention_mask"].to("cuda"),
-                        source_intervention_mask=batch["disentangled_source_intervention_mask"].to("cuda"),
-                        labels=batch["disentangled_labels"].to("cuda"),
-                    )
-                    batch_disentangling_pred_ids = torch.argmax(disentangling_prediction["logits"], dim=-1)
-                    
-                    correct_disentangling = []
-                    
-                    for label, pred_ids in zip(batch["disentangled_labels"].to("cuda"), batch_disentangling_pred_ids):
-                        label_idx = label != -100
-                        output_idx = torch.zeros_like(label_idx)
-                        output_idx[:-1] = label_idx[1:]
-                        
-                        label = label[label_idx]
-                        pred_ids = pred_ids[output_idx]
-                        
-                        correct_disentangling.append((torch.sum(label == pred_ids) == torch.numel(label)))
-                    
-                    correct_disentangling = torch.stack(correct_disentangling)
-                    
-                    test_loss[-1] += disentangling_prediction["loss"].item()
+                is_causal.extend(batch["is_causal"].cpu().numpy().tolist())
                 
                 for i, (label, pred_ids) in enumerate(zip(batch["labels"].to("cuda"), batch_pred_ids)):
                     label_idx = label != -100
@@ -373,20 +279,31 @@ class RavelInterpretorHypernetwork(nn.Module):
                     label = label[label_idx]
                     pred_ids = pred_ids[output_idx]
                     
-                    is_correct = (torch.sum (label == pred_ids) == torch.numel(label)).item()
-                    if disentangling:
-                        instance_idx = torch.nonzero(batch["disentangled_example_idxs"].to("cuda") == i).squeeze()
-                        """if type(instance_idx.item()) == int:
-                            is_correct = is_correct and correct_disentangling[instance_idx].item()
-                        else:"""
-                        is_correct = is_correct and all(correct_disentangling[instance_idx])
-                        
-                    correct += is_correct
+                    if eval_n_label_tokens is not None and len(label) > eval_n_label_tokens:
+                        label = label[:eval_n_label_tokens]
+                        pred_ids = pred_ids[:eval_n_label_tokens]
+                    
+                    is_correct = (torch.sum (label == pred_ids) == torch.numel(label)).item()    
                     if is_correct:
                         correct_idxs.append(batch_id * len(batch["labels"]) + i)
-                    total += 1
+        
+        total_causal = sum(is_causal)
+        total_isolate = len(is_causal) - total_causal
+        
+        correct_causal = sum([is_causal[i] for i in correct_idxs])
+        correct_isolate = len(correct_idxs) - correct_causal
+        
+        causal_acc = correct_causal / total_causal if total_causal > 0 else 0.0
+        isolate_acc = correct_isolate / total_isolate if total_isolate > 0 else 0.0
+        disentangle_acc = 0.5 * (causal_acc + isolate_acc)
+        
+        accuracies = {
+            "causal": causal_acc,
+            "isolate": isolate_acc,
+            "disentangle": disentangle_acc
+        }
                     
-        return correct / total, sum(test_loss) / len(test_loss), correct_idxs
+        return accuracies, sum(test_loss) / len(test_loss), correct_idxs
              
 
     def run_train(
@@ -396,7 +313,6 @@ class RavelInterpretorHypernetwork(nn.Module):
         epochs=1,
         eval_per_steps: int = None,
         checkpoint_per_steps: int = None,
-        disentangling = False,
         lr=3e-4,
         weight_decay=0.01,
         save_dir=None,
@@ -405,14 +321,12 @@ class RavelInterpretorHypernetwork(nn.Module):
         if save_dir is not None and not os.path.exists(save_dir):
             os.makedirs(save_dir)
             
-        # print(self.interpretor.das_module.rotate_layer.named_parameters())
-            
         trainable_parameters = []
         for name, param in self.named_parameters():
             if "target_model" not in name:
                 if "das_module" in name:
                     if "rotate_layer" in name:
-                        trainable_parameters += [{"params": param, "lr": self.rotate_lr}]
+                        trainable_parameters += [{"params": param, "lr": self.rotate_lr, "weight_decay": 0.0}]
                     else:
                         trainable_parameters += [{"params": param, "lr": self.boundary_lr}]
                 else:
@@ -425,7 +339,7 @@ class RavelInterpretorHypernetwork(nn.Module):
         
         if self.use_das_intervention:
             das_temperature_schedule = torch.linspace(
-                self.das_temperature_start, self.das_temperature_end, total_steps
+                self.das_temperature_start, self.das_temperature_end, total_steps + 1
             ).to(self.interpretor_config.torch_dtype).to("cuda")
             self.interpretor.das_module.set_temperature(das_temperature_schedule[cur_steps])
 
@@ -447,18 +361,25 @@ class RavelInterpretorHypernetwork(nn.Module):
                     if eval_per_steps is not None:
                         if cur_steps % eval_per_steps == 0:
                             # Evaluate the model
-                            accuracy, test_loss, _ = self.eval_accuracy(
-                                test_loader, disentangling=disentangling, inference_mode=None
+                            accuracies, test_loss, _ = self.eval_accuracy(
+                                test_loader, inference_mode=None, eval_n_label_tokens=3
                             )
+                            
+                            causal_acc = accuracies["causal"]
+                            isolate_acc = accuracies["isolate"]
+                            disentangle_acc = accuracies["disentangle"]
                                                         
                             if wandb.run:
                                 wandb.log(
                                     {
                                         "test_average_loss": test_loss,
-                                        "test_accuracy": accuracy,
+                                        "causal_accuracy": causal_acc,
+                                        "isolate_accuracy": isolate_acc,
+                                        "disentangle_accuracy": disentangle_acc,
                                     }
                                 )
-                            print(f"Accuracy: {accuracy}, Test Loss: {test_loss}")
+                                
+                            print(f"Disentangle Acc: {disentangle_acc}, Causal Acc: {causal_acc}, Isolate Acc: {isolate_acc}, Test Loss: {test_loss}")
 
                     if checkpoint_per_steps is not None:
                         if cur_steps % checkpoint_per_steps == 0 and save_dir is not None:
@@ -483,22 +404,7 @@ class RavelInterpretorHypernetwork(nn.Module):
                         inference_mode=None
                     )
 
-                    self.prediction_loss = self.prediction["loss"]
-                    
-                    if disentangling:
-                        self.prediction_loss += self.forward(
-                            editor_input_ids=batch["disentangled_editor_input_ids"].to("cuda"),
-                            base_input_ids=batch["disentangled_base_input_ids"].to("cuda"),
-                            base_attention_mask=batch["disentangled_base_attention_mask"].to("cuda"),
-                            base_intervention_mask=batch["disentangled_base_intervention_mask"].to("cuda"),
-                            source_input_ids=batch["disentangled_source_input_ids"].to("cuda"),
-                            source_attention_mask=batch["disentangled_source_attention_mask"].to("cuda"),
-                            source_intervention_mask=batch["disentangled_source_intervention_mask"].to("cuda"),
-                            labels=batch["disentangled_labels"].to("cuda"),
-                            output_intervention_weight=True,
-                            inference_mode=None
-                        )["loss"]
-                            
+                    self.prediction_loss = self.prediction["loss"]                            
                     self.training_loss = self.prediction_loss
                     
                     if self.use_das_intervention and self.das_dim is None:
@@ -507,15 +413,8 @@ class RavelInterpretorHypernetwork(nn.Module):
                     self.training_loss.backward()
                     nn.utils.clip_grad_norm_(
                         self.parameters(), 4.0
-                    )  # just implemented this! dunno if a cap of 1 to large, so I'm messing with reducing it
-
-                    # Check for nan gradients
-                    # if check_nan_gradients(self):
-                    #     break
-                    # print(self.interpretor.das_module.rotate_layer.parametrizations.weight.original)
-                    # Backwards step
+                    )
                     self.opt.step()
-
                     # metrics
                     epoch_train_loss += self.training_loss.item() * current_batch_size
                     gradients = [
