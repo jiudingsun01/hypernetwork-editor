@@ -25,6 +25,7 @@ class RavelInterpretorHypernetwork(nn.Module):
         das_intervention=True,
         torch_dtype=torch.bfloat16,
         das_dimension=None,
+        allow_selective_column_space=False,
     ):
         super().__init__()
 
@@ -36,7 +37,12 @@ class RavelInterpretorHypernetwork(nn.Module):
         self.interpretor_config.intervention_layer = intervention_layer
         self.interpretor_config._attn_implementation = 'eager'
                 
-        self.interpretor = LlamaInterpretor(self.interpretor_config, das_intervention=das_intervention, das_dimension=das_dimension)
+        self.interpretor = LlamaInterpretor(
+            self.interpretor_config, 
+            das_intervention=das_intervention, 
+            das_dimension=das_dimension,
+            das_selective_subspace=allow_selective_column_space
+        )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
         self.use_das_intervention = das_intervention
@@ -220,17 +226,19 @@ class RavelInterpretorHypernetwork(nn.Module):
 
         source_axis = [self.tokenizer.decode([i]) for i in source_input_ids] + ["[SELF]"]
         base_axis = [self.tokenizer.decode([i]) for i in base_input_ids]
-        editor_text = self.tokenizer.decode(editor_input_ids)
+        editor_text = self.tokenizer.decode(editor_input_ids, skip_special_tokens=True)
         label = label[label != -100]
         label = self.tokenizer.decode(label)
 
-        _, ax = plt.subplots(figsize=(10, 10))
+        _, ax = plt.subplots(figsize=(15, 15))
        
-        sns.heatmap(intervention_weight.float().cpu().numpy(), xticklabels=base_axis, yticklabels=source_axis, ax=ax, annot=annot)
+        plot = sns.heatmap(intervention_weight.float().cpu().numpy(), xticklabels=base_axis, yticklabels=source_axis, ax=ax, annot=annot, fmt=".2f")
 
         ax.set_title(f"Instruction: {editor_text}     Label: {label}    Pred: {results['batch_output'][example_id]}")
         ax.set_xlabel("Base Sentence Tokens")
         ax.set_ylabel("Source Sentence Tokens")
+        
+        return plot, ax
         
         
     def eval_accuracy(self, test_loader, inference_mode=None, eval_n_label_tokens=None):
@@ -327,8 +335,10 @@ class RavelInterpretorHypernetwork(nn.Module):
                 if "das_module" in name:
                     if "rotate_layer" in name:
                         trainable_parameters += [{"params": param, "lr": self.rotate_lr, "weight_decay": 0.0}]
-                    else:
+                    elif "mask_projection" in name:
                         trainable_parameters += [{"params": param, "lr": self.boundary_lr}]
+                    else:
+                        trainable_parameters += [{"params": param}]
                 else:
                     trainable_parameters += [{"params": param}]
         
@@ -380,7 +390,7 @@ class RavelInterpretorHypernetwork(nn.Module):
                                 )
                                 
                             print(f"Disentangle Acc: {disentangle_acc}, Causal Acc: {causal_acc}, Isolate Acc: {isolate_acc}, Test Loss: {test_loss}")
-
+                        
                     if checkpoint_per_steps is not None:
                         if cur_steps % checkpoint_per_steps == 0 and save_dir is not None:
                             print("Saving model to {}".format(os.path.join(save_dir, f"model_epoch_{epoch}_step_{step}")))
@@ -454,6 +464,7 @@ class RavelInterpretorHypernetwork(nn.Module):
                             / num_datapoints_in_epoch,
                         }
                     )
+                    
         # Save the final model
         if save_dir is not None:
             self.save_model(os.path.join(save_dir, "final_model"))

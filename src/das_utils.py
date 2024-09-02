@@ -46,17 +46,17 @@ class BoundlessRotatedSpaceIntervention(torch.nn.Module):
 
     """Intervention in the rotated space with boundary mask."""
 
-    def __init__(self, embed_dim, **kwargs):
+    def __init__(self, embed_dim, torch_dtype, **kwargs):
         super().__init__(**kwargs)
         self.embed_dim = embed_dim
-        rotate_layer = RotateLayer(self.embed_dim)
+        rotate_layer = RotateLayer(self.embed_dim, torch_dtype=torch_dtype)
         self.rotate_layer = torch.nn.utils.parametrizations.orthogonal(rotate_layer)
         self.intervention_boundaries = torch.nn.Parameter(
-            torch.tensor([0.5]), requires_grad=True
+            torch.tensor([0.5], dtype=torch_dtype), requires_grad=True
         )
-        self.temperature = torch.nn.Parameter(torch.tensor(50.0))
+        self.temperature = torch.nn.Parameter(torch.tensor(50.0, dtype=torch_dtype))
         self.intervention_population = torch.nn.Parameter(
-            torch.arange(0, self.embed_dim), requires_grad=False
+            torch.arange(0, self.embed_dim, dtype=torch_dtype), requires_grad=False
         )
 
     def get_boundary_parameters(self):
@@ -177,17 +177,18 @@ class LowRankRotatedSpaceIntervention(TrainableIntervention, DistributedRepresen
 
     """Intervention in the rotated space."""
 
-    def __init__(self, **kwargs):
+    def __init__(self, embed_dim, low_rank_dimension, **kwargs):
         super().__init__(**kwargs)
-        rotate_layer = LowRankRotateLayer(self.embed_dim, kwargs["low_rank_dimension"], init_orth=False)
+        self.embed_dim = embed_dim
+        rotate_layer = LowRankRotateLayer(self.embed_dim, low_rank_dimension, init_orth=False)
         self.rotate_layer = torch.nn.utils.parametrizations.orthogonal(rotate_layer)
-        self.sparsity = kwargs["low_rank_dimension"] / self.embed_dim
+        self.sparsity = low_rank_dimension / self.embed_dim
         
     def get_boundary_parameters(self):
         return None
     
     def get_boundary_sparsity(self):
-        return self.sparsity
+        return torch.Tensor([self.sparsity])
     
     def get_temperature(self):
         pass
@@ -210,3 +211,51 @@ class LowRankRotatedSpaceIntervention(TrainableIntervention, DistributedRepresen
     
     def __str__(self):
         return f"LowRankRotatedSpaceIntervention()"
+    
+
+class SelectiveLowRankRotatedSpaceIntervention(TrainableIntervention, DistributedRepresentationIntervention):
+
+    """Intervention in the rotated space."""
+
+    def __init__(self, embed_dim, low_rank_dimension, torch_dtype=torch.float32, **kwargs):
+        super().__init__(**kwargs)
+        self.embed_dim = embed_dim
+        rotate_layer = LowRankRotateLayer(self.embed_dim, low_rank_dimension, init_orth=False)
+        self.rotate_layer = torch.nn.utils.parametrizations.orthogonal(rotate_layer)
+        self.mask_projection = torch.nn.Linear(self.embed_dim, low_rank_dimension, bias=True, dtype=torch_dtype)
+        
+        # Initialize bias with a large value to make the mask close to 1 initially
+        # self.mask_projection.bias.data.fill_(500.0)
+        
+        self.sparsity = low_rank_dimension / self.embed_dim
+        self.temperature = torch.nn.Parameter(torch.tensor(50.0, dtype=torch_dtype), requires_grad=False)
+        
+    def get_boundary_parameters(self):
+        return None
+    
+    def get_boundary_sparsity(self):
+        return torch.Tensor([self.sparsity])
+    
+    def get_temperature(self):
+        return self.temperature
+
+    def set_temperature(self, temp: torch.Tensor):
+        self.temperature.data = temp
+
+    def set_intervention_boundaries(self, intervention_boundaries):
+        return None
+
+    def forward(self, base, source, hidden_states):
+        rotated_base = self.rotate_layer(base)
+        rotated_source = self.rotate_layer(source)
+        
+        mask = self.mask_projection(hidden_states[:, -1, :])
+        mask = torch.sigmoid(mask / self.temperature)        
+        mask = mask.unsqueeze(1)
+        output = base + torch.matmul(
+            mask * (rotated_source - rotated_base), self.rotate_layer.weight.T
+        )
+        return output.to(base.dtype)
+    
+    def __str__(self):
+        return f"SelectiveLowRankRotatedSpaceIntervention()"

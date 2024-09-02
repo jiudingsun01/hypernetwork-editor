@@ -26,6 +26,7 @@ def run_experiment(
     wandb_run_name=None,
     intervention_layer=15,
     no_das=False,
+    selective_das=False,
     model_name_or_path="/work/frink/models/llama3-8B-HF",
     batch_size=8,
     source_suffix_visibility=True,
@@ -72,7 +73,7 @@ def run_experiment(
                 "target_attributes": target_attributes,
             },
         )
-    
+
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -119,6 +120,7 @@ def run_experiment(
         intervention_layer=intervention_layer,
         das_intervention=use_das_intervention,
         das_dimension=das_dimension,
+        allow_selective_column_space=selective_das
     )
 
     hypernetwork = hypernetwork.to("cuda")
@@ -155,8 +157,8 @@ if __name__ == "__main__":
     parser.add_argument("--source_suffix_visibility", default=False, action="store_true")
     parser.add_argument("--base_suffix_visibility", default=False, action="store_true")
     parser.add_argument("--save_dir", type=str, default=None)
-    parser.add_argument("--test_path", type=str, default= "./data/ravel/prompt_generalization_test")
-    parser.add_argument("--train_path", type=str, default= "./data/ravel/prompt_generalization_train")
+    parser.add_argument("--test_path", type=str, default= "./data/ravel/mixed_test")
+    parser.add_argument("--train_path", type=str, default= "./data/ravel/mixed_train")
     
     parser.add_argument("--filtered_dataset_path", type=str, default=None)
     
@@ -164,15 +166,16 @@ if __name__ == "__main__":
     parser.add_argument("--n_samples", type=int, default=20000)
     parser.add_argument("--train_test_split", type=int, default=0.97)
     parser.add_argument("--domain", type=str, default="city")
-    parser.add_argument('--isolate_attributes', nargs='+', default=["Continent"])
-    parser.add_argument('--target_attributes', nargs='+', default=["Country"])
+    parser.add_argument('--isolate_attributes', nargs='+', default=["Country", "Continent", "Language", "Timezone", "Longitude", "Latitude"])
+    parser.add_argument('--target_attributes', nargs='+', default=["Country", "Continent", "Language", "Timezone", "Longitude", "Latitude"])
     
     # if None, use Boundless DAS
+    parser.add_argument("--selective_das", type=bool, default=True)
     parser.add_argument("--das_dimension", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--eval_per_steps", type=int, default=100)
-    parser.add_argument("--checkpoint_per_steps", type=int, default=500)
+    parser.add_argument("--checkpoint_per_steps", type=int, default=1000)
     
     
     args = parser.parse_args()

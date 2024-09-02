@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=training_1
+#SBATCH --job-name=training_0
 #SBATCH --output=./logs/train_Language_das.out
 #SBATCH --partition=177huntington
 #SBATCH --nodes=1
@@ -15,4 +15,4 @@ cd /work/frink/sun.jiu/hypernetwork-editor
 conda activate subspace
 
 
-python train.py --wandb_project hypernetwork-interp-city-Language --save_dir city_Language_das --dataset_path ./data/ravel/city_Language --disentangling  --use_das_intervention  --das_dimension 256 
+python train.py --save_dir city_Language_L15 --wandb_project hypernetwork-autointerp --isolate_attributes Country Continent Longitude Latitude --target_attributes Language --das_dimension 128 

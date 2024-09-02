@@ -519,4 +519,5 @@ class InterpretorUnembedCrossAttention(LlamaAttentionWithCrossAttention):
         attn_weights = attn_weights.view(bsz, 1, source_n_tokens + 1, base_n_tokens).squeeze()
         attn_weights = nn.functional.softmax(attn_weights, dim=1, dtype=torch.float32).to(query_states.dtype)
         
-        return None, attn_weights, past_key_value
+        # return None, attn_weights, past_key_value
+        return attn_weights

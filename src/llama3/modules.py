@@ -23,7 +23,7 @@ from ..utils import (
     assign_layer_indices,
 )
 from .layers import InterpretorUnembedCrossAttention, LlamaDecoderLayerWithDoubleCrossAttention
-from ..das_utils import BoundlessRotatedSpaceIntervention, RotatedSpaceIntervention, LowRankRotatedSpaceIntervention
+from ..das_utils import BoundlessRotatedSpaceIntervention, RotatedSpaceIntervention, LowRankRotatedSpaceIntervention, SelectiveLowRankRotatedSpaceIntervention
 
 from tqdm import tqdm
 from torch import optim
@@ -358,7 +358,7 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
             torch.cuda.set_device(self.transformer.first_device)
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
-        reverse_attention_output = self.lm_head(
+        attn_weight = self.lm_head(
             hidden_states,
             attention_mask=attention_mask,
             base_encoder_hidden_states=base_hidden_states,
@@ -369,11 +369,11 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
         )
 
         # (output, present[,attentions])
-        return reverse_attention_output
+        return hidden_states, attn_weight
 
 
 class LlamaInterpretor(nn.Module):
-    def __init__(self, config: LlamaInterpretorConfig, das_intervention=False, das_dimension=None):
+    def __init__(self, config: LlamaInterpretorConfig, das_intervention=False, das_dimension=None, das_selective_subspace=False):
         super().__init__()
 
         self.config = config
@@ -385,24 +385,24 @@ class LlamaInterpretor(nn.Module):
         self.bidding_threshold = 0.1
         
         self.use_das_intervention = das_intervention
-        
+        self.das_selective_subspace = das_selective_subspace
+                
         if self.use_das_intervention:
             
             if das_dimension is None:
                 self.das_module = BoundlessRotatedSpaceIntervention(
-                    embed_dim=self.target_model.config.hidden_size
+                    embed_dim=self.target_model.config.hidden_size, torch_dtype=config.torch_dtype
                 )
             else:
-                """
-                self.das_module = RotatedSpaceIntervention(
-                    embed_dim=self.target_model.config.hidden_size, intervention_dim=das_dimension
-                )
-                """
-                
-                self.das_module = LowRankRotatedSpaceIntervention(
-                    embed_dim=self.target_model.config.hidden_size, low_rank_dimension=das_dimension
-                )
-            
+                if das_selective_subspace:           
+                    self.das_module = SelectiveLowRankRotatedSpaceIntervention(
+                        embed_dim=self.target_model.config.hidden_size, low_rank_dimension=das_dimension, torch_dtype=config.torch_dtype
+                    )
+                else:
+                    self.das_module = LowRankRotatedSpaceIntervention(
+                        embed_dim=self.target_model.config.hidden_size, low_rank_dimension=das_dimension, torch_dtype=config.torch_dtype
+                    )
+                    
         # freeze target model
         for param in self.target_model.parameters():
             param.requires_grad = False
@@ -572,7 +572,7 @@ class LlamaInterpretor(nn.Module):
             )
 
             # Multiply the outputs by normalization factors
-            _, intervention_weight, _ = interpretor_output
+            hypernet_hidden_states, intervention_weight = interpretor_output
             intervention_weight = intervention_weight.squeeze()
             
         if inference_mode == "global_argmax":
@@ -593,7 +593,7 @@ class LlamaInterpretor(nn.Module):
         elif inference_mode == "bidding_argmax":
             batch_size, num_src_pos, num_base_pos = intervention_weight.shape
             bidding_weight = torch.argmax(intervention_weight[:, :-1, :], dim=-1)
-            bidding_weight = torch.nn.functional.one_hot(bidding_weight, num_classes=num_src_pos - 1).float()
+            bidding_weight = torch.nn.functional.one_hot(bidding_weight, num_classes=num_base_pos).float()
             bidding_weight = torch.cat([bidding_weight, torch.ones(batch_size, 1, num_base_pos).to(bidding_weight.device)], dim=1)
             intervention_weight = torch.where(bidding_weight == 1, intervention_weight, torch.zeros_like(intervention_weight))
             if self.bidding_threshold is not None:
@@ -625,7 +625,12 @@ class LlamaInterpretor(nn.Module):
             
             if self.use_das_intervention:
                 source_intervention_hidden_states = intervention_matrix + torch.einsum("bid,bi->bid", base_hidden_states, - base_intervention_weight)
-                mixed_output = self.das_module(base_hidden_states, source_intervention_hidden_states, batch_size)
+                
+                if self.das_selective_subspace:
+                    mixed_output = self.das_module(base_hidden_states, source_intervention_hidden_states, hypernet_hidden_states)
+                else:
+                    mixed_output = self.das_module(base_hidden_states, source_intervention_hidden_states, batch_size)
+                
                 output[0][:] += (mixed_output - base_hidden_states)
             else:
                 res_diff = torch.einsum("bid,bi->bid", base_hidden_states, (1 - base_intervention_weight))

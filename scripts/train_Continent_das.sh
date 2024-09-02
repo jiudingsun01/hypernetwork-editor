@@ -15,4 +15,4 @@ cd /work/frink/sun.jiu/hypernetwork-editor
 conda activate subspace
 
 
-python train.py --wandb_project hypernetwork-interp-city-Continent --save_dir city_Continent_das --dataset_path ./data/ravel/city_Continent --disentangling  --use_das_intervention  --das_dimension 256 
+python train.py --save_dir city_Continent_L15 --wandb_project hypernetwork-autointerp --isolate_attributes Country Language Longitude Latitude --target_attributes Continent --das_dimension 128 

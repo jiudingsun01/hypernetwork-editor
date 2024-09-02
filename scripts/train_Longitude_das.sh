@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=training_1
+#SBATCH --job-name=training_2
 #SBATCH --output=./logs/train_Longitude_das.out
 #SBATCH --partition=177huntington
 #SBATCH --nodes=1
@@ -15,4 +15,4 @@ cd /work/frink/sun.jiu/hypernetwork-editor
 conda activate subspace
 
 
-python train.py --wandb_project hypernetwork-interp-city-Longitude --save_dir city_Longitude_das --dataset_path ./data/ravel/city_Longitude --disentangling  --use_das_intervention  --das_dimension 256 
+python train.py --save_dir city_Longitude_L15 --wandb_project hypernetwork-autointerp --isolate_attributes Country Continent Language Latitude --target_attributes Longitude --das_dimension 128 
