@@ -24,12 +24,12 @@ def run_experiment(
     log_wandb=True,
     wandb_project="hypernetworks-interpretor",
     wandb_run_name=None,
+    inference_modes=["default", "bidding_argmax"],
     intervention_layer=15,
-    no_das=False,
-    selective_das=False,
-    model_name_or_path="/work/frink/models/llama3-8B-HF",
+    subspace_module="ReflectSelect",
+    model_name_or_path="/home/ubuntu/llama3-8b",
     batch_size=8,
-    source_suffix_visibility=True,
+    source_suffix_visibility=False,
     base_suffix_visibility=False,
     save_dir=None,
     das_dimension=None,
@@ -53,7 +53,7 @@ def run_experiment(
     if save_dir is not None:
         save_dir = os.path.join("./models", save_dir)
         
-    use_das_intervention = not no_das
+    
         
     if log_wandb:
         wandb.init(
@@ -64,7 +64,7 @@ def run_experiment(
                 "editormodel": model_name_or_path, 
                 "dataset": "ravel",
                 "intervention_layer": intervention_layer,
-                "das_intervention": use_das_intervention,
+                "subspace_module": subspace_module,
                 "source_suffix_visibility": source_suffix_visibility,
                 "base_suffix_visibility": base_suffix_visibility,
                 "das_dimension": das_dimension,
@@ -73,6 +73,10 @@ def run_experiment(
                 "target_attributes": target_attributes,
             },
         )
+        
+    if "default" in inference_modes:
+        inference_modes.remove("default")
+        inference_modes.append(None)
 
     tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
     tokenizer.pad_token = tokenizer.eos_token
@@ -118,9 +122,8 @@ def run_experiment(
         model_name_or_path=model_name_or_path,
         num_editing_heads=32,
         intervention_layer=intervention_layer,
-        das_intervention=use_das_intervention,
+        subspace_module=subspace_module,
         das_dimension=das_dimension,
-        allow_selective_column_space=selective_das
     )
 
     hypernetwork = hypernetwork.to("cuda")
@@ -129,6 +132,7 @@ def run_experiment(
     hypernetwork.run_train(
         train_loader=data_loader,
         test_loader=test_data_loader,
+        inference_modes=inference_modes,
         epochs=n_epochs,
         checkpoint_per_steps = checkpoint_per_steps,
         eval_per_steps = eval_per_steps,
@@ -150,32 +154,35 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="hypernetworks-interpretor")
     parser.add_argument("--wandb_run_name", type=str, default=None)
     parser.add_argument("--intervention_layer", type=int, default=15)
+    
     parser.add_argument("--n_epochs", type=int, default=3)
-    parser.add_argument("--no_das", default=False, action="store_true")
-    parser.add_argument("--model_name_or_path", type=str, default="/work/frink/models/llama3-8B-HF")
-    parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument("--model_name_or_path", type=str, default="/home/ubuntu/llama3-8b")
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--source_suffix_visibility", default=False, action="store_true")
     parser.add_argument("--base_suffix_visibility", default=False, action="store_true")
     parser.add_argument("--save_dir", type=str, default=None)
-    parser.add_argument("--test_path", type=str, default= "./data/ravel/mixed_test")
-    parser.add_argument("--train_path", type=str, default= "./data/ravel/mixed_train")
+    parser.add_argument("--test_path", type=str, default= "./data/ravel/baseline_debug_test")
+    parser.add_argument("--train_path", type=str, default= "./data/ravel/baseline_debug_train")
     
     parser.add_argument("--filtered_dataset_path", type=str, default=None)
     
     # if filtered_dataset_path is not None:
-    parser.add_argument("--n_samples", type=int, default=20000)
+    parser.add_argument("--n_samples", type=int, default=10000)
     parser.add_argument("--train_test_split", type=int, default=0.97)
     parser.add_argument("--domain", type=str, default="city")
-    parser.add_argument('--isolate_attributes', nargs='+', default=["Country", "Continent", "Language", "Timezone", "Longitude", "Latitude"])
-    parser.add_argument('--target_attributes', nargs='+', default=["Country", "Continent", "Language", "Timezone", "Longitude", "Latitude"])
+    parser.add_argument('--isolate_attributes', nargs='+', default=["Country"])
+    parser.add_argument('--target_attributes', nargs='+', default=["Country", "Continent"])
+    
+    parser.add_argument('--inference_modes', nargs='+', default=["default", "bidding_argmax"])
+    
     
     # if None, use Boundless DAS
-    parser.add_argument("--selective_das", type=bool, default=True)
+    parser.add_argument('--subspace_module', default="DAS", choices=[None, "DAS", "BoundlessDAS", "MaskSelect", "ReflectSelect"])
     parser.add_argument("--das_dimension", type=int, default=128)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--eval_per_steps", type=int, default=100)
-    parser.add_argument("--checkpoint_per_steps", type=int, default=1000)
+    parser.add_argument("--checkpoint_per_steps", type=int, default=None)
     
     
     args = parser.parse_args()

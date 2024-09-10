@@ -18,11 +18,11 @@ class RavelInterpretorHypernetwork(nn.Module):
     # Separating the editor config file, from its base model's configurations
     def __init__(
         self,
-        model_name_or_path="/work/frink/models/llama3-8B-HF",
+        model_name_or_path="/home/ubuntu/llama3-8b",
         num_editing_heads=32,
         chop_editor_at_layer=8,
         intervention_layer=0,
-        das_intervention=True,
+        subspace_module="ReflectSelect",
         torch_dtype=torch.bfloat16,
         das_dimension=None,
         allow_selective_column_space=False,
@@ -39,13 +39,12 @@ class RavelInterpretorHypernetwork(nn.Module):
                 
         self.interpretor = LlamaInterpretor(
             self.interpretor_config, 
-            das_intervention=das_intervention, 
+            subspace_module=subspace_module, 
             das_dimension=das_dimension,
-            das_selective_subspace=allow_selective_column_space
         )
         self.tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
 
-        self.use_das_intervention = das_intervention
+        self.use_das_intervention = subspace_module != None
         self.das_dim = das_dimension
         self.residual_cache = None
         self.opt = None
@@ -318,6 +317,7 @@ class RavelInterpretorHypernetwork(nn.Module):
         self,
         train_loader,
         test_loader=None,
+        inference_modes=[None],
         epochs=1,
         eval_per_steps: int = None,
         checkpoint_per_steps: int = None,
@@ -371,25 +371,30 @@ class RavelInterpretorHypernetwork(nn.Module):
                     if eval_per_steps is not None:
                         if cur_steps % eval_per_steps == 0:
                             # Evaluate the model
-                            accuracies, test_loss, _ = self.eval_accuracy(
-                                test_loader, inference_mode=None, eval_n_label_tokens=3
-                            )
                             
-                            causal_acc = accuracies["causal"]
-                            isolate_acc = accuracies["isolate"]
-                            disentangle_acc = accuracies["disentangle"]
-                                                        
-                            if wandb.run:
-                                wandb.log(
-                                    {
-                                        "test_average_loss": test_loss,
-                                        "causal_accuracy": causal_acc,
-                                        "isolate_accuracy": isolate_acc,
-                                        "disentangle_accuracy": disentangle_acc,
-                                    }
+                            for mode in inference_modes:
+                                accuracies, test_loss, _ = self.eval_accuracy(
+                                    test_loader, inference_mode=mode, eval_n_label_tokens=3
                                 )
                                 
-                            print(f"Disentangle Acc: {disentangle_acc}, Causal Acc: {causal_acc}, Isolate Acc: {isolate_acc}, Test Loss: {test_loss}")
+                                text_mode = "default" if mode is None else mode
+                                
+                                causal_acc = accuracies["causal"]
+                                isolate_acc = accuracies["isolate"]
+                                disentangle_acc = accuracies["disentangle"]
+                                                        
+                                if wandb.run:
+                                    wandb.log(
+                                        {
+                                            f"{text_mode}_test_average_loss": test_loss,
+                                            f"{text_mode}_causal_accuracy": causal_acc,
+                                            f"{text_mode}_isolate_accuracy": isolate_acc,
+                                            f"{text_mode}_disentangle_accuracy": disentangle_acc,
+                                        }
+                                    )
+                                
+                                print("Under Inference Mode: ", text_mode)
+                                print(f"Disentangle Acc: {disentangle_acc}, Causal Acc: {causal_acc}, Isolate Acc: {isolate_acc}, Test Loss: {test_loss}")
                         
                     if checkpoint_per_steps is not None:
                         if cur_steps % checkpoint_per_steps == 0 and save_dir is not None:
@@ -399,7 +404,6 @@ class RavelInterpretorHypernetwork(nn.Module):
                     self.batch = batch
                     current_batch_size = len(batch["editor_input_ids"])
                     num_datapoints_in_epoch += current_batch_size
-                    self.opt.zero_grad()
 
                     self.prediction = self.forward(
                         editor_input_ids=batch["editor_input_ids"].to("cuda"),
@@ -433,6 +437,12 @@ class RavelInterpretorHypernetwork(nn.Module):
                     all_gradients = torch.cat(gradients)
                     gradient_norm = torch.norm(all_gradients).item()
                     epoch_gradient_norm += gradient_norm * current_batch_size
+                    
+                    self.opt.zero_grad()
+                    
+                    # TEST: orthogonalize the rotation matrix every step
+                    """if self.use_das_intervention:
+                        self.interpretor.das_module.orthogonalize_rotation_matrix()"""
 
                     metrics = {
                         "step": cur_steps,

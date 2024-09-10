@@ -23,7 +23,7 @@ from ..utils import (
     assign_layer_indices,
 )
 from .layers import InterpretorUnembedCrossAttention, LlamaDecoderLayerWithDoubleCrossAttention
-from ..das_utils import BoundlessRotatedSpaceIntervention, RotatedSpaceIntervention, LowRankRotatedSpaceIntervention, SelectiveLowRankRotatedSpaceIntervention
+from ..das_utils import BoundlessRotatedSpaceIntervention, RotatedSpaceIntervention, LowRankRotatedSpaceIntervention, SelectiveLowRankRotatedSpaceIntervention,ReflectiveLowRankRotatedSpaceIntervention
 
 from tqdm import tqdm
 from torch import optim
@@ -373,7 +373,7 @@ class LlamaInterpretorHypernetwork(LlamaForCausalLM):
 
 
 class LlamaInterpretor(nn.Module):
-    def __init__(self, config: LlamaInterpretorConfig, das_intervention=False, das_dimension=None, das_selective_subspace=False):
+    def __init__(self, config: LlamaInterpretorConfig, subspace_module=None, das_dimension=None):
         super().__init__()
 
         self.config = config
@@ -384,24 +384,29 @@ class LlamaInterpretor(nn.Module):
         
         self.bidding_threshold = 0.1
         
-        self.use_das_intervention = das_intervention
-        self.das_selective_subspace = das_selective_subspace
+        self.use_das_intervention = subspace_module != None
+        self.das_selective_subspace = subspace_module in ["ReflectSelect", "MaskSelect"]
                 
         if self.use_das_intervention:
             
-            if das_dimension is None:
+            if subspace_module == "BoundlessDAS":
                 self.das_module = BoundlessRotatedSpaceIntervention(
                     embed_dim=self.target_model.config.hidden_size, torch_dtype=config.torch_dtype
                 )
+            elif subspace_module == "DAS":
+                self.das_module = LowRankRotatedSpaceIntervention(
+                    embed_dim=self.target_model.config.hidden_size, low_rank_dimension=das_dimension, torch_dtype=config.torch_dtype
+                )
+            elif subspace_module == "MaskSelect":
+                self.das_module = SelectiveLowRankRotatedSpaceIntervention(
+                    embed_dim=self.target_model.config.hidden_size, low_rank_dimension=das_dimension, torch_dtype=config.torch_dtype
+                )
+            elif subspace_module == "ReflectSelect":
+                self.das_module = ReflectiveLowRankRotatedSpaceIntervention(
+                    embed_dim=self.target_model.config.hidden_size, low_rank_dimension=das_dimension, torch_dtype=config.torch_dtype
+                )
             else:
-                if das_selective_subspace:           
-                    self.das_module = SelectiveLowRankRotatedSpaceIntervention(
-                        embed_dim=self.target_model.config.hidden_size, low_rank_dimension=das_dimension, torch_dtype=config.torch_dtype
-                    )
-                else:
-                    self.das_module = LowRankRotatedSpaceIntervention(
-                        embed_dim=self.target_model.config.hidden_size, low_rank_dimension=das_dimension, torch_dtype=config.torch_dtype
-                    )
+                raise ValueError("Invalid subspace module")
                     
         # freeze target model
         for param in self.target_model.parameters():
